@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+
+# harness artifacts
+.drip/
+
+# local databases created inside a working copy
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
