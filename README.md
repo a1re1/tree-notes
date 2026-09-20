@@ -35,6 +35,7 @@ treenotes read       [PATH] [--depth N] [--members] [--json]
 treenotes set        PATH [--note TEXT] [--expected-hash HASH] [--ast] [--json]
 treenotes member-set PATH SYMBOL [--note TEXT] [--expected-hash HASH] [--json]
 treenotes import     [FILE|-] [--json]
+treenotes state      [--compare HASH] [--json]
 ```
 
 Global options:
@@ -81,6 +82,15 @@ Commands:
   rejected, notes must be non-empty single lines, and every `hash` must equal the *current* hash of
   that path. Only then is the whole batch written in one transaction — one bad record means no
   notes at all are written.
+* `state [--compare HASH]` — report the `tnt1:state` hash of the whole current working tree, the
+  commit it was observed at, whether this database had already recorded that exact state, and how
+  much of the AST member cache would survive a rebuild. By default it is compared against the most
+  recently recorded *different* state; `--compare HASH` compares against one named recorded state.
+  The comparison lists only real leaves: `added`, `modified`, `kind-changed` (a file replaced by a
+  symlink, say) and `removed`, ordered by path. A state this database has not seen is recorded (once)
+  with the current commit and a full entry list, so later runs can name exactly what changed without
+  re-reading anything; re-observing a known state writes nothing. Directories are omitted from the
+  change list because a directory hash moves exactly when one of its leaves does.
 
 ### Path arguments
 
@@ -148,6 +158,7 @@ silently reused.
 | submodule | `tnt1:submodule:H` = BLAKE3(`treenotes-hash-v1\|submodule\0` \|\| index gitlink sha) |
 | directory | `tnt1:dir:H` = BLAKE3(`treenotes-hash-v1\|dir\0` \|\| children) |
 | member | `tnt2:member:H` = BLAKE3(`treenotes-hash-v2\|member\0` \|\| symbol key \|\| `\0` \|\| normalised declaration text) |
+| state | `tnt1:state:H` = BLAKE3(`treenotes-hash-v1\|state\0` \|\| entries) |
 
 Member hashes deliberately use a **different scheme tag** (`tnt2`) because they hash different input:
 not whole working-tree bytes but `symbol_key = <kind>:<qualified name>:<ordinal>` plus the
@@ -162,11 +173,27 @@ name then kind tag before hashing. Directory hashes are computed bottom-up, so e
 removing or renaming a descendant changes the hashes of its ancestors only — unrelated siblings keep
 their hash, their status and their notes.
 
+State entries are encoded the same way as directory children but over the whole inventory:
+`u32-le(path length) || path || kind tag || u32-le(hash length) || hash`, in path order. The state
+hash is therefore a pure function of what the tree contains — not of Git history — so an unchanged
+checkout always reports the same state, including in another worktree and after an empty commit.
+Recording a state stores that list, which is what makes "what changed since?" a diff between two
+recorded inventories instead of a re-read.
+
 **Cost.** Hashing is O(total bytes) per invocation, streamed and never buffered whole. `read` and
 `pending` re-hash the **entire** inventory even when a scope limits how much output is printed (a
-deliberate trade: no fragile on-disk snapshot cache, and scoped output always agrees with unscoped
-output). A scope bounds the listing, not the scanning; large repositories are dominated by this
-scan regardless of `pending PATH` or `read PATH --depth N`.
+deliberate trade: the hash of a scope always agrees with the hash of the whole tree). A scope bounds
+the listing, not the scanning; large repositories are dominated by this scan regardless of
+`pending PATH` or `read PATH --depth N`.
+
+**The repeated work that is cached** is the *parsing*, not the hashing. `read --members`, `set
+--ast` and `member-set` need the members of a file, and parsing a supported source file is far more
+expensive than hashing it. Members are cached in the database under `(path, file hash)` — the hash
+just computed from the bytes on disk — so a file that did not change is never parsed twice, and an
+edited file misses the cache and is parsed again. The cache is keyed by content, never by
+mtime, and it never caches a *note*: notes stay bound to hashes exactly as before. A `tnt1:state`
+hash answers the coarser question ("has this build already computed this whole tree?") and lets a
+recorded state stand in for the commit a rebuild would otherwise diff against.
 
 ## Note status semantics
 
@@ -264,6 +291,12 @@ Field notes:
   the records just written — the write the caller just performed is reported back, no timestamp is
   read again — while a subsequent `read`/`pending` of the same fresh entry carries the stored
   `note_updated_at`.
+* `state` appears only on `state --json`. It carries `state_hash`, `commit` (null before the first
+  commit), `known` (this exact state was already recorded), `recorded` (this run wrote it),
+  `member_cache_hits`/`member_cache_misses` (counts of supported source leaves in the tree whose
+  members are or are not already cached), `compared_state` (the recorded state compared against, or
+  `null`) and `changes` (one record per added, modified, kind-changed or removed leaf, ordered by
+  path, each with `hash` and `previous_hash`).
 
 `import` input — one JSON array, all fields required, unknown fields rejected:
 
@@ -320,7 +353,10 @@ Re-run `pending` after concurrent edits.
 * Notes are not garbage-collected; history grows with distinct annotated versions.
 * Linked worktrees share notes; independent clones of the same upstream do not (different common
   directories, therefore different repository identities).
-* Hashing is proportional to the bytes in the tree, on every invocation.
+* Hashing is proportional to the bytes in the tree, on every invocation. The derived member cache
+  removes repeated *parsing*, not the inventory scan, and notes are cached only implicitly (an
+  unchanged file's members are reused, but its note is still resolved from the `member_notes`
+  table).
 
 ## Development
 
@@ -339,7 +375,10 @@ Methods and other named declarations inside a file can be annotated in Java, Rus
 TypeScript/TSX, JavaScript and Python: `read PATH --members` lists them, `member-set` annotates one
 of them, and `set PATH --ast` carries a file's existing member summaries forward after an edit.
 Member notes use the `tnt2` hash scheme and live in their own `member_notes` table; the `tnt1`
-file/dir/symlink/submodule scheme and every file note are untouched, and a version-1 database is
-migrated additively. Adding a language is one adapter module plus one registry entry — see
+file/dir/symlink/submodule scheme and every file note are untouched, and older databases are
+migrated additively (schema version 3 adds the derived state tables `snapshots`/`snapshot_entries`
+and the derived member cache `member_index_files`/`member_index` — all four are regenerable and can
+be dropped at any time without losing a note). Adding a language is one adapter module plus one
+registry entry — see
 [`docs/ast-annotations-plan.md`](docs/ast-annotations-plan.md) for the design and the decisions
 still open (comment stripping, ordinal churn, member-vs-file precedence in `pending`).

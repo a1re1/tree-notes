@@ -410,8 +410,11 @@ These are the choices worth a maintainer's yes/no; each has a cost to change lat
 
 ## 9. Open questions / risks
 
-* **Rename churn** — renames create a `missing` member and orphan a stale note. A future
-  "member rename" command or a similarity-based suggestion could help; out of scope now.
+* **Rename churn** — renames create a `missing` member and orphan a stale note. Content hashing
+  already keeps the *unchanged* members' notes intact (see §12): moving a method inside the same file
+  changes only that method's own hash, and an untouched file is not even reparsed. A rename is still
+  a new declaration with no note, and the old note stays bound to the old symbol as `previous`; a
+  future similarity-based suggestion could help, but is out of scope.
 * **Grammar ABI drift** — even pinned, a grammar crate's minor bump can add/rename node kinds.
   The adapter-completeness tests turn that into a loud test failure. Keep the pin exact and upgrade
   deliberately.
@@ -434,6 +437,10 @@ These are the choices worth a maintainer's yes/no; each has a cost to change lat
 * Optional per-language opt-in via `~/.tree-notes/config.toml`, if feature-flagged grammars are
   ever introduced.
 * Member-level `import` streaming for repositories large enough that a batch exceeds memory.
+* Diffing two *recorded* states down to the member level: `state --compare` already names which
+  files changed, so a follow-up could parse only the changed files and leave the cached members of
+  the rest untouched even when the file hash is unchanged but the note text changed.
+* Per-language feature flags, if the six grammar crates' build cost ever needs trimming.
 
 ## 11. Implementation status (this branch)
 
@@ -456,3 +463,92 @@ These are the choices worth a maintainer's yes/no; each has a cost to change lat
 
 Open for the maintainer, unchanged from §8 and §9: comment/doc-comment stripping, member ordinals
 and overload churn, member-vs-file note precedence in `pending`, and per-language build cost.
+
+## 12. Incremental recomputation (this branch)
+
+The build cost of parsing is acceptable, so this branch does not change *what* is computed. It
+makes repeating that computation cheap, and it does so without a second hash scheme or a second
+notion of identity.
+
+### 12.1 Nothing at the top level is replaced
+
+A member note is **supplemental**. Every guarantee the top level had, it still has:
+
+* `entries` in every envelope keep their version-1 shape, meaning and order; `members` is a sibling
+  array that is empty for commands that deal in no members.
+* Member notes live in their own `member_notes` table. Writing one never touches `notes`, so a
+  `member-set` cannot change a file's status, hash or note — and `set PATH` (without `--ast`) cannot
+  change any member's status, hash or note.
+* `set PATH --ast` is the one command that writes both, and it still writes the file note for the
+  file's current hash *and* only carries *existing* member text forward; it never invents a member
+  note, and it never rewrites a member that is already fresh.
+* `pending` continues to list files, directories, symlinks and submodules exactly as before.
+  Member-level pending is deliberately not added: a file with unannotated members still shows up as
+  the file it is, and the deeper listing is opt-in via `read PATH --members`.
+* JSON `version` stays `2`: the new `state` block is emitted only by `state`, absent (not `null`)
+  everywhere else, so no existing consumer sees a changed shape.
+
+### 12.2 Hashes, not paths, decide whether work is redone
+
+The existing member hash is already the answer to rename churn: `tnt2:member:<hex>` covers the
+symbol key *and* the declaration's own text, so an edit to one method changes only that method's
+hash, reordering differently-named declarations changes nothing, and formatting-only changes inside
+one declaration keep it fresh. Two things follow, both already tested:
+
+* One edited method re-stales exactly that member: its siblings stay `fresh` with their notes.
+* A renamed declaration is a new symbol at a new hash — a different note, never a rebinding.
+
+### 12.3 The repository state hash
+
+`tnt1:state:<hex>` = BLAKE3(`treenotes-hash-v1|state\0` || entries), where each entry contributes
+`u32-le(path length) || path || kind tag || u32-le(hash length) || hash`, in path order. It is a
+pure function of paths, kinds and content hashes — *not* of Git history — so:
+
+* an unchanged checkout reports the same state on every invocation, including from another linked
+  worktree, and after an empty commit;
+* reverting to a previously observed tree reproduces that tree's state hash exactly, so a settled
+  state is recognisable later;
+* it is the global summary a future git-branch comparison can key on: the state hash is what "have
+  we already computed this?" is asked with.
+
+`treenotes state` records a state it has not seen before, together with every `(path, kind, hash)` of
+that state and the commit HEAD pointed at when it was observed — that stored entry list is the stable
+side of a later diff. Recording is once per distinct state, so repeat runs are read-only.
+
+`state` also names what changed against a recorded state (`--compare HASH`, else the most recently
+recorded *different* state), leaf by leaf: `added`, `modified`, `kind-changed`, `removed`. Directories
+are omitted because a directory hash moves exactly when one of its leaves does. A rename is one
+removal plus one addition, which is the honest description of it: the same bytes at a new path are a
+different note.
+
+### 12.4 The member cache
+
+Parsing is the expensive part; it is cached in the derived tables `member_index_files` (one marker
+row per `(path, file hash)`, carrying that parse's `parse_error`) and `member_index` (the members
+with their symbol keys, spans and hashes).
+
+* The key is the **file hash the inventory just computed from the bytes on disk**, so an edited file
+  misses and is reparsed, and a file that did not change is never parsed twice. No mtime, no
+  assumption about bytes that were not hashed.
+* An empty member list is a real cached answer, which is why the marker row exists: `None` (never
+  parsed) and `Some(vec![])` (parsed, no members) mean different things.
+* `state` reports `member_cache_hits`/`member_cache_misses` over the supported source leaves, so the
+  saving is observable rather than asserted.
+* Rows for a path's *other* file hashes are dropped when a new parse is stored: the cache is only
+  ever consulted with the file's current hash, so those rows can never be asked for again.
+
+### 12.5 Schema
+
+Schema version 3 adds `snapshots`, `snapshot_entries`, `member_index_files` and `member_index`. The
+`1 -> 2` migration is unchanged; `2 -> 3` is additive, and every version-3 table is derived data
+that can be dropped at any time. Losing all four costs a reparse and a re-recorded state; it never
+costs a note.
+
+### 12.6 What is deliberately *not* here
+
+* No member-level `pending`, and no change to `pending`'s tree-level meaning.
+* No reuse of a cached **note**: notes stay bound to hashes through `member_notes` exactly as before.
+* No mtime- or stat-based fast path in the inventory: the scan still hashes every working-tree file
+  on every invocation, which is what keeps scoped and unscoped output in agreement.
+* No git-ref plumbing beyond reading `HEAD` for the commit label: comparing against a *branch* rather
+  than a recorded state is the follow-up in §10, and the state hash is the hook it needs.

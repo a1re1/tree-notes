@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::repo::Kind;
 use crate::{CmdError, SCHEMA_VERSION};
@@ -43,6 +43,59 @@ CREATE TABLE member_notes (
     UNIQUE (repository, path, symbol, hash)
 );
 CREATE INDEX member_notes_repository_path ON member_notes (repository, path);
+";
+
+/// Derived state schema, created on a fresh database and added by the version 1/2 -> 3 migrations.
+///
+/// Nothing here is a note: `snapshots`/`snapshot_entries` remember which repository states have
+/// already been computed (and at which commit), and `member_index_files`/`member_index` cache the
+/// members parsed for one file hash so an unchanged file is never parsed twice. Dropping all four
+/// tables loses no note and only costs a reparse.
+///
+/// Every statement is `IF NOT EXISTS`, so applying this to a database whose recorded version is
+/// behind its actual tables (a rewound `user_version`, or a tool older than the tables it found)
+/// adds only what is genuinely missing instead of failing the whole migration.
+const STATE_SCHEMA_SQL: &str = "
+CREATE TABLE IF NOT EXISTS snapshots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository  TEXT NOT NULL,
+    state_hash  TEXT NOT NULL,
+    commit_sha  TEXT,
+    updated_at  TEXT NOT NULL,
+    UNIQUE (repository, state_hash)
+);
+CREATE INDEX IF NOT EXISTS snapshots_repository_id ON snapshots (repository, id);
+CREATE TABLE IF NOT EXISTS snapshot_entries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id INTEGER NOT NULL,
+    path        TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    hash        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS snapshot_entries_snapshot ON snapshot_entries (snapshot_id, path);
+CREATE TABLE IF NOT EXISTS member_index_files (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository  TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    file_hash   TEXT NOT NULL,
+    parse_error INTEGER NOT NULL,
+    updated_at  TEXT NOT NULL,
+    UNIQUE (repository, path, file_hash)
+);
+CREATE TABLE IF NOT EXISTS member_index (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository     TEXT NOT NULL,
+    path           TEXT NOT NULL,
+    file_hash      TEXT NOT NULL,
+    symbol         TEXT NOT NULL,
+    symbol_kind    TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    start_line     INTEGER NOT NULL,
+    end_line       INTEGER NOT NULL,
+    hash           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS member_index_lookup ON member_index (repository, path, file_hash);
 ";
 
 /// One stored member-note version.
@@ -183,12 +236,17 @@ impl Store {
         if version == SCHEMA_VERSION {
             return Ok(());
         }
-        if version == 1 {
-            // Additive migration: a version-1 database keeps every file note and gains the
-            // member-note table. No existing row is rewritten.
+        if version == 1 || version == 2 {
+            // Additive migration: an older database keeps every note and gains exactly the tables
+            // its version lacks. No existing row is rewritten.
+            if version == 1 {
+                transaction.execute_batch(MEMBER_SCHEMA_SQL).map_err(|e| {
+                    CmdError::env(format!("cannot add the member-note schema: {e}"))
+                })?;
+            }
             transaction
-                .execute_batch(MEMBER_SCHEMA_SQL)
-                .map_err(|e| CmdError::env(format!("cannot add the member-note schema: {e}")))?;
+                .execute_batch(STATE_SCHEMA_SQL)
+                .map_err(|e| CmdError::env(format!("cannot add the state schema: {e}")))?;
             transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|e| CmdError::env(format!("cannot set the schema version: {e}")))?;
@@ -219,6 +277,9 @@ impl Store {
         transaction
             .execute_batch(MEMBER_SCHEMA_SQL)
             .map_err(|e| CmdError::env(format!("cannot create the member-note schema: {e}")))?;
+        transaction
+            .execute_batch(STATE_SCHEMA_SQL)
+            .map_err(|e| CmdError::env(format!("cannot create the state schema: {e}")))?;
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| CmdError::env(format!("cannot set the schema version: {e}")))?;
@@ -465,4 +526,359 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     } as u32;
     let year = if month <= 2 { year + 1 } else { year };
     (year, month, day)
+}
+/// One cached AST member of a file whose bytes are still exactly the ones it was parsed from.
+#[derive(Clone, Debug)]
+pub struct CachedMember {
+    /// Symbol key, `<symbol-kind>:<qualified name>:<ordinal>`.
+    pub symbol: String,
+    /// treenotes member kind.
+    pub symbol_kind: String,
+    /// Declared name as written.
+    pub name: String,
+    /// Name qualified by its container chain.
+    pub qualified_name: String,
+    /// 1-based first line of the declaration in the parsed bytes.
+    pub start_line: usize,
+    /// 1-based last line of the declaration in the parsed bytes.
+    pub end_line: usize,
+    /// Member hash of the declaration.
+    pub hash: String,
+}
+
+/// The `(path, kind, hash)` rows of one recorded state, in insertion order.
+pub type SnapshotEntries = Vec<(String, String, String)>;
+
+/// One recorded repository state.
+#[derive(Clone, Debug)]
+pub struct SnapshotInfo {
+    /// `tnt1:state:<hex>` of the recorded state.
+    pub state_hash: String,
+    /// Commit observed when the state was recorded, when the repository had one.
+    pub commit: Option<String>,
+    /// RFC3339 UTC timestamp of the last recording of this state.
+    pub updated_at: String,
+}
+
+/// Derived state and member-cache storage.
+impl Store {
+    /// Cached members of `path` at exactly `file_hash`, with that parse's error flag, or `None`
+    /// when those bytes have never been parsed.
+    ///
+    /// An empty vector is a real cached answer ("this file has no members"), which is why the
+    /// marker row in `member_index_files` exists: `None` and `Some(vec![])` mean different things.
+    pub fn load_member_index(
+        &self,
+        repository: &str,
+        path: &str,
+        file_hash: &str,
+    ) -> Result<Option<(bool, Vec<CachedMember>)>, CmdError> {
+        let marker: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT parse_error FROM member_index_files WHERE repository = ?1 AND path = ?2 \
+                 AND file_hash = ?3",
+                rusqlite::params![repository, path, file_hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| CmdError::env(format!("cannot read the member cache: {e}")))?;
+        let Some(parse_error) = marker else {
+            return Ok(None);
+        };
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT symbol, symbol_kind, name, qualified_name, start_line, end_line, hash \
+                 FROM member_index WHERE repository = ?1 AND path = ?2 AND file_hash = ?3 \
+                 ORDER BY start_line ASC, symbol ASC",
+            )
+            .map_err(|e| CmdError::env(format!("cannot read the member cache: {e}")))?;
+        let rows = statement
+            .query_map(rusqlite::params![repository, path, file_hash], |row| {
+                Ok(CachedMember {
+                    symbol: row.get(0)?,
+                    symbol_kind: row.get(1)?,
+                    name: row.get(2)?,
+                    qualified_name: row.get(3)?,
+                    start_line: row.get::<_, i64>(4)? as usize,
+                    end_line: row.get::<_, i64>(5)? as usize,
+                    hash: row.get(6)?,
+                })
+            })
+            .map_err(|e| CmdError::env(format!("cannot read the member cache: {e}")))?;
+        let mut members = Vec::new();
+        for row in rows {
+            members.push(
+                row.map_err(|e| CmdError::env(format!("cannot read the member cache: {e}")))?,
+            );
+        }
+        Ok(Some((parse_error != 0, members)))
+    }
+
+    /// Replace the cached members of `path` with the ones just parsed for `file_hash`.
+    ///
+    /// Rows for other file hashes of the same path are dropped: that content can never be asked
+    /// for again, because the cache is only ever consulted with the file's current hash.
+    pub fn store_member_index(
+        &mut self,
+        repository: &str,
+        path: &str,
+        file_hash: &str,
+        parse_error: bool,
+        members: &[CachedMember],
+    ) -> Result<(), CmdError> {
+        let transaction = self
+            .conn
+            .transaction()
+            .map_err(|e| CmdError::env(format!("cannot start a database transaction: {e}")))?;
+        transaction
+            .execute(
+                "DELETE FROM member_index WHERE repository = ?1 AND path = ?2",
+                rusqlite::params![repository, path],
+            )
+            .and_then(|_| {
+                transaction.execute(
+                    "DELETE FROM member_index_files WHERE repository = ?1 AND path = ?2",
+                    rusqlite::params![repository, path],
+                )
+            })
+            .map_err(|e| {
+                CmdError::env(format!("cannot refresh the member cache for {path}: {e}"))
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO member_index_files (repository, path, file_hash, parse_error, \
+                 updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    repository,
+                    path,
+                    file_hash,
+                    if parse_error { 1_i64 } else { 0_i64 },
+                    now_rfc3339()
+                ],
+            )
+            .map_err(|e| {
+                CmdError::env(format!("cannot refresh the member cache for {path}: {e}"))
+            })?;
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO member_index (repository, path, file_hash, symbol, symbol_kind, \
+                     name, qualified_name, start_line, end_line, hash) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                )
+                .map_err(|e| {
+                    CmdError::env(format!("cannot refresh the member cache for {path}: {e}"))
+                })?;
+            for member in members {
+                statement
+                    .execute(rusqlite::params![
+                        repository,
+                        path,
+                        file_hash,
+                        member.symbol,
+                        member.symbol_kind,
+                        member.name,
+                        member.qualified_name,
+                        member.start_line as i64,
+                        member.end_line as i64,
+                        member.hash
+                    ])
+                    .map_err(|e| {
+                        CmdError::env(format!("cannot refresh the member cache for {path}: {e}"))
+                    })?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|e| CmdError::env(format!("cannot commit the member cache for {path}: {e}")))
+    }
+
+    /// Every `(path, file_hash)` pair whose members are already cached for this repository.
+    ///
+    /// One query, so accounting for a whole tree stays O(1) round trips to the database.
+    pub fn member_index_keys(
+        &self,
+        repository: &str,
+    ) -> Result<std::collections::BTreeSet<(String, String)>, CmdError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT path, file_hash FROM member_index_files WHERE repository = ?1")
+            .map_err(|e| CmdError::env(format!("cannot read the member cache: {e}")))?;
+        let rows = statement
+            .query_map([repository], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| CmdError::env(format!("cannot read the member cache: {e}")))?;
+        let mut keys = std::collections::BTreeSet::new();
+        for row in rows {
+            keys.insert(
+                row.map_err(|e| CmdError::env(format!("cannot read the member cache: {e}")))?,
+            );
+        }
+        Ok(keys)
+    }
+
+    /// Record `state_hash`, the commit it was observed at and every entry of the state, so a
+    /// later invocation can name exactly what changed without re-reading anything.
+    pub fn record_snapshot(
+        &mut self,
+        repository: &str,
+        state_hash: &str,
+        commit: Option<&str>,
+        entries: &[crate::repo::Entry],
+    ) -> Result<(), CmdError> {
+        let transaction = self
+            .conn
+            .transaction()
+            .map_err(|e| CmdError::env(format!("cannot start a database transaction: {e}")))?;
+        transaction
+            .execute(
+                "INSERT INTO snapshots (repository, state_hash, commit_sha, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (repository, state_hash) DO UPDATE SET \
+                 commit_sha = excluded.commit_sha, updated_at = excluded.updated_at",
+                rusqlite::params![repository, state_hash, commit, now_rfc3339()],
+            )
+            .map_err(|e| CmdError::env(format!("cannot record the state: {e}")))?;
+        let snapshot_id: i64 = transaction
+            .query_row(
+                "SELECT id FROM snapshots WHERE repository = ?1 AND state_hash = ?2",
+                rusqlite::params![repository, state_hash],
+                |row| row.get(0),
+            )
+            .map_err(|e| CmdError::env(format!("cannot record the state: {e}")))?;
+        transaction
+            .execute(
+                "DELETE FROM snapshot_entries WHERE snapshot_id = ?1",
+                [snapshot_id],
+            )
+            .map_err(|e| CmdError::env(format!("cannot record the state: {e}")))?;
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO snapshot_entries (snapshot_id, path, kind, hash) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|e| CmdError::env(format!("cannot record the state: {e}")))?;
+            for entry in entries {
+                statement
+                    .execute(rusqlite::params![
+                        snapshot_id,
+                        entry.path,
+                        entry.kind.as_str(),
+                        entry.hash
+                    ])
+                    .map_err(|e| CmdError::env(format!("cannot record the state: {e}")))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|e| CmdError::env(format!("cannot commit the recorded state: {e}")))
+    }
+
+    /// The recorded state with this exact hash, when this build has already computed it.
+    pub fn snapshot_info(
+        &self,
+        repository: &str,
+        state_hash: &str,
+    ) -> Result<Option<SnapshotInfo>, CmdError> {
+        self.conn
+            .query_row(
+                "SELECT state_hash, commit_sha, updated_at FROM snapshots \
+                 WHERE repository = ?1 AND state_hash = ?2",
+                rusqlite::params![repository, state_hash],
+                |row| {
+                    Ok(SnapshotInfo {
+                        state_hash: row.get(0)?,
+                        commit: row.get(1)?,
+                        updated_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| CmdError::env(format!("cannot read the recorded states: {e}")))
+    }
+
+    /// The recorded state with this exact hash, with its entries.
+    pub fn snapshot(
+        &self,
+        repository: &str,
+        state_hash: &str,
+    ) -> Result<Option<(SnapshotInfo, SnapshotEntries)>, CmdError> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT id, state_hash, commit_sha, updated_at FROM snapshots WHERE \
+                 repository = ?1 AND state_hash = ?2 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![repository, state_hash],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        SnapshotInfo {
+                            state_hash: row.get(1)?,
+                            commit: row.get(2)?,
+                            updated_at: row.get(3)?,
+                        },
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| CmdError::env(format!("cannot read the recorded states: {e}")))?;
+        let Some((snapshot_id, info)) = found else {
+            return Ok(None);
+        };
+        let entries = self.snapshot_entry_rows(snapshot_id)?;
+        Ok(Some((info, entries)))
+    }
+
+    /// Every `(path, kind, hash)` row of one recorded state.
+    fn snapshot_entry_rows(&self, snapshot_id: i64) -> Result<SnapshotEntries, CmdError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT path, kind, hash FROM snapshot_entries WHERE snapshot_id = ?1")
+            .map_err(|e| CmdError::env(format!("cannot read the recorded states: {e}")))?;
+        let rows = statement
+            .query_map([snapshot_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| CmdError::env(format!("cannot read the recorded states: {e}")))?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(
+                row.map_err(|e| CmdError::env(format!("cannot read the recorded states: {e}")))?,
+            );
+        }
+        Ok(entries)
+    }
+
+    /// The most recently recorded state whose hash is not `exclude`, with its entries.
+    pub fn latest_snapshot(
+        &self,
+        repository: &str,
+        exclude: Option<&str>,
+    ) -> Result<Option<(SnapshotInfo, SnapshotEntries)>, CmdError> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT id, state_hash, commit_sha, updated_at FROM snapshots WHERE \
+                 repository = ?1 AND (?2 IS NULL OR state_hash <> ?2) ORDER BY id DESC LIMIT 1",
+                rusqlite::params![repository, exclude],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        SnapshotInfo {
+                            state_hash: row.get(1)?,
+                            commit: row.get(2)?,
+                            updated_at: row.get(3)?,
+                        },
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| CmdError::env(format!("cannot read the recorded states: {e}")))?;
+        let Some((snapshot_id, info)) = found else {
+            return Ok(None);
+        };
+        let entries = self.snapshot_entry_rows(snapshot_id)?;
+        Ok(Some((info, entries)))
+    }
 }

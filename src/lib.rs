@@ -21,13 +21,18 @@ pub const PROGRAM: &str = "treenotes";
 /// Version of the JSON envelope written by `--json` commands.
 ///
 /// Version 2 adds the `members` array (AST member notes) plus the `parse_error` flag; the
-/// `entries` array keeps its version-1 shape.
+/// `entries` array keeps its version-1 shape. The `state` block is emitted only by `treenotes
+/// state` and is absent (not null) everywhere else, so no version-1 or version-2 consumer sees a
+/// changed shape.
 pub const JSON_VERSION: u32 = 2;
 
 /// Version of the SQLite schema this build reads and writes.
 ///
-/// Version 2 adds the `member_notes` table; version-1 databases are migrated additively.
-pub const SCHEMA_VERSION: i64 = 2;
+/// Version 2 adds the `member_notes` table; version 3 adds the derived state tables
+/// (`snapshots`, `snapshot_entries`) and the derived member cache (`member_index_files`,
+/// `member_index`). Older databases are migrated additively, and everything version 3 adds is
+/// derived data that can be dropped at any time without losing a note.
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Exit code: success.
 pub const EXIT_OK: u8 = 0;

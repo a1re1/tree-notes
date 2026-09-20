@@ -116,6 +116,12 @@ pub struct Member {
     pub hash: String,
 }
 
+/// The `tnt2:member:` scheme tag, so callers can recognise a member hash without duplicating the
+/// constant.
+pub fn member_scheme() -> &'static str {
+    hash::MEMBER_SCHEME
+}
+
 /// Members of one file, plus whether the grammar had to recover from a syntax error.
 #[derive(Clone, Debug)]
 pub struct ParseResult {

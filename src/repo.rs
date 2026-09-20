@@ -8,6 +8,11 @@
 //! * dir      `tnt1:dir:<hex>` = BLAKE3(`treenotes-hash-v1|dir\0` || children), where each child
 //!   contributes `u32-le(name length) || name || kind tag || u32-le(hash length) || hash`, and
 //!   children are sorted by name then kind tag.
+//! * state    `tnt1:state:<hex>` = BLAKE3(`treenotes-hash-v1|state\0` || entries), where each
+//!   entry contributes `u32-le(path length) || path || kind tag || u32-le(hash length) || hash`,
+//!   in path order. It is the one hash that names a whole repository *state*: two states with
+//!   equal state hashes have identical paths, kinds and content hashes, so anything derived from
+//!   them (member lists, notes) is identical too.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -25,6 +30,7 @@ const PREFIX_DIR: &[u8] = b"treenotes-hash-v1|dir\0";
 const PREFIX_SYMLINK: &[u8] = b"treenotes-hash-v1|symlink\0";
 const PREFIX_SUBMODULE: &[u8] = b"treenotes-hash-v1|submodule\0";
 const PREFIX_REPO: &[u8] = b"treenotes-repo-v1\0";
+const PREFIX_STATE: &[u8] = b"treenotes-hash-v1|state\0";
 
 /// The kind of a tree entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -150,6 +156,29 @@ impl Repo {
             self.root.clone()
         } else {
             self.root.join(relative)
+        }
+    }
+
+    /// Commit `HEAD` points at in this worktree, or `None` while the repository has no commit
+    /// yet (an unborn branch). The commit is advisory metadata for a recorded state: a state can
+    /// be recorded, and matched again, entirely from content hashes without any commit at all.
+    pub fn head_commit(&self) -> Result<Option<String>, CmdError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+            .output()
+            .map_err(|e| CmdError::from_context("failed to run git", e))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let text = String::from_utf8(output.stdout)
+            .map_err(|_| CmdError::env("git returned a non-UTF-8 commit"))?;
+        let commit = text.trim();
+        if commit.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(commit.to_string()))
         }
     }
 
@@ -404,6 +433,26 @@ pub fn depth_within(scope: &str, path: &str) -> usize {
     } else {
         depth_of(path) - depth_of(scope)
     }
+}
+
+/// Aggregate hash of a whole tree state: the path, kind and hash of every entry, in path order.
+///
+/// It is a pure function of the inventory, so two checkouts with the same paths and the same
+/// file, directory, symlink and submodule hashes produce the same state hash — which is what
+/// makes "have we already computed this state?" answerable without re-reading the tree.
+pub fn state_hash(entries: &[Entry]) -> String {
+    let mut ordered: Vec<&Entry> = entries.iter().collect();
+    ordered.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(PREFIX_STATE);
+    for entry in ordered {
+        hasher.update(&(entry.path.len() as u32).to_le_bytes());
+        hasher.update(entry.path.as_bytes());
+        hasher.update(&[entry.kind.tag()]);
+        hasher.update(&(entry.hash.len() as u32).to_le_bytes());
+        hasher.update(entry.hash.as_bytes());
+    }
+    format!("{HASH_SCHEME}:state:{}", hasher.finalize().to_hex())
 }
 
 /// True when `path` is the scope itself or a descendant of a directory scope.

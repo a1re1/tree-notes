@@ -403,6 +403,58 @@ pub struct EntryJson {
     pub previous: Option<PreviousJson>,
 }
 
+/// One entry-level change between the current state and a recorded state.
+#[derive(Debug, Serialize)]
+pub struct StateChangeJson {
+    /// Repository-root relative path.
+    pub path: String,
+    /// Entry kind in the current state (`file`, `symlink`, `submodule`).
+    pub kind: String,
+    /// `added`, `removed`, `modified`, or `kind-changed`.
+    pub change: String,
+    /// Current hash, absent for `removed`.
+    pub hash: Option<String>,
+    /// Hash in the compared state, present when the path existed there.
+    pub previous_hash: Option<String>,
+    /// Kind in the compared state, present only for `kind-changed`.
+    pub previous_kind: Option<String>,
+}
+
+/// The recorded state a `treenotes state` run was compared against.
+#[derive(Debug, Serialize)]
+pub struct ComparedStateJson {
+    /// `tnt1:state:<hex>` of the compared state.
+    pub state_hash: String,
+    /// Commit the compared state was observed at, when it was recorded with one.
+    pub commit: Option<String>,
+    /// When the compared state was recorded.
+    pub updated_at: String,
+}
+
+/// The derived state block emitted by `treenotes state`.
+#[derive(Debug, Serialize)]
+pub struct StateJson {
+    /// Aggregate hash of the current inventory: the path, kind and hash of every entry, in path
+    /// order. Equal state hashes mean identical trees, so anything derived from them is
+    /// identical too.
+    pub state_hash: String,
+    /// Commit `HEAD` pointed at when the state was observed; null before the first commit.
+    pub commit: Option<String>,
+    /// True when this exact state hash had already been recorded by an earlier invocation.
+    pub known: bool,
+    /// Whether this invocation recorded the state.
+    pub recorded: bool,
+    /// Source files whose members are already cached for their current content hash.
+    pub member_cache_hits: usize,
+    /// Source files whose members would have to be parsed again.
+    pub member_cache_misses: usize,
+    /// The recorded state this run is compared against, when one exists.
+    pub compared_state: Option<ComparedStateJson>,
+    /// Entry-level changes against `compared_state`, ordered by path. Directories are omitted:
+    /// a directory hash changes exactly when one of its leaves does.
+    pub changes: Vec<StateChangeJson>,
+}
+
 /// JSON form of the latest historical note.
 #[derive(Debug, Serialize)]
 pub struct PreviousJson {
@@ -494,6 +546,9 @@ pub struct Envelope {
     /// True when the grammar had to recover from a syntax error in the scoped files.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parse_error: Option<bool>,
+    /// Derived state block, present only on `state`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<StateJson>,
     /// Deterministically ordered entries.
     pub entries: Vec<EntryJson>,
     /// Deterministically ordered AST members.
@@ -512,6 +567,7 @@ impl Envelope {
             imported: None,
             message: None,
             parse_error: None,
+            state: None,
             entries: Vec::new(),
             members: Vec::new(),
         }

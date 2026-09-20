@@ -1432,7 +1432,7 @@ fn concurrent_fresh_processes_initialize_one_schema() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2, "schema version after concurrent initialization");
+    assert_eq!(version, 3, "schema version after concurrent initialization");
     let count: i64 = conn
         .query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
         .unwrap();
@@ -1824,15 +1824,23 @@ fn version_one_databases_migrate_additively() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2);
-    let tables: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name = 'member_notes'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(tables, 1, "the member table is created by the migration");
+    assert_eq!(version, 3);
+    for table in [
+        "member_notes",
+        "snapshots",
+        "snapshot_entries",
+        "member_index_files",
+        "member_index",
+    ] {
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1, "{table} is created by the migration");
+    }
     drop(conn);
 
     // The migrated database accepts member notes straight away.
@@ -1847,4 +1855,128 @@ fn version_one_databases_migrate_additively() {
     ]);
     let json = sandbox.json(&["read", "Cache.java", "--members", "--json"]);
     assert_eq!(sandbox.member(&json, "class:Cache:0")["status"], "fresh");
+}
+
+#[test]
+fn schema_two_databases_gain_only_the_derived_tables() {
+    let sandbox = marker_repo();
+    sandbox.annotate("a.txt", "keep me across the migration");
+
+    // Rewind the database to the version-2 shape: the note tables only, no derived state.
+    let conn = sandbox.db_conn();
+    conn.execute_batch(
+        "DROP TABLE member_index; DROP TABLE member_index_files; DROP TABLE snapshot_entries; \
+         DROP TABLE snapshots; PRAGMA user_version = 2;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let json = sandbox.json(&["read", "a.txt", "--json"]);
+    assert_eq!(json["version"], 2);
+    assert_eq!(
+        sandbox.entry(&json, "a.txt")["note"],
+        "keep me across the migration"
+    );
+
+    // The derived state tables exist again and the state command works on the migrated database.
+    let state = sandbox.json(&["state", "--json"]);
+    assert!(state["state"]["state_hash"].as_str().is_some(), "{state}");
+}
+
+#[test]
+fn state_hashes_the_tree_and_names_only_what_changed() {
+    let sandbox = Sandbox::new();
+    let java = fixture("tests/fixtures/java/Cache.java");
+    sandbox.write("a.txt", "alpha\n");
+    sandbox.write("d/f.txt", "f\n");
+    sandbox.write("Cache.java", &java);
+    sandbox.commit("init");
+
+    let first = sandbox.json(&["state", "--json"]);
+    let state_hash = first["state"]["state_hash"].as_str().unwrap().to_string();
+    assert!(state_hash.starts_with("tnt1:state:"), "{first}");
+    assert_eq!(first["version"], 2);
+    assert_eq!(first["command"], "state");
+    assert_eq!(first["state"]["known"], false);
+    assert_eq!(first["state"]["recorded"], true);
+    assert!(first["state"]["commit"].as_str().is_some(), "{first}");
+    assert!(first["state"]["compared_state"].is_null());
+    assert_eq!(first["state"]["changes"].as_array().unwrap().len(), 0);
+    // Only the Java fixture is source; nothing has parsed it yet.
+    assert_eq!(first["state"]["member_cache_hits"], 0);
+    assert_eq!(first["state"]["member_cache_misses"], 1);
+
+    // Re-observing the identical tree is a cache hit: nothing is re-recorded.
+    let again = sandbox.json(&["state", "--json"]);
+    assert_eq!(again["state"]["state_hash"], first["state"]["state_hash"]);
+    assert_eq!(again["state"]["known"], true);
+    assert_eq!(again["state"]["recorded"], false);
+
+    // Parsing a file once is enough for every later state report.
+    sandbox.json(&["read", "Cache.java", "--members", "--json"]);
+    let cached = sandbox.json(&["state", "--json"]);
+    assert_eq!(cached["state"]["member_cache_hits"], 1);
+    assert_eq!(cached["state"]["member_cache_misses"], 0);
+
+    // The state hash names content, not history: a commit that changes no bytes leaves it alone.
+    sandbox.git(&["commit", "-q", "--allow-empty", "-m", "empty"]);
+    assert_eq!(
+        sandbox.json(&["state", "--json"])["state"]["state_hash"],
+        state_hash
+    );
+
+    // One edited file and one rename, diffed against the first recorded state.
+    sandbox.write("a.txt", "alpha edited\n");
+    sandbox.write("d/g.txt", "f\n");
+    sandbox.remove("d/f.txt");
+    sandbox.commit("edit and rename");
+    let changed = sandbox.json(&["state", "--json", "--compare", &state_hash]);
+    let changes = changed["state"]["changes"].as_array().unwrap().clone();
+    let described: Vec<(String, String)> = changes
+        .iter()
+        .map(|change| {
+            (
+                change["path"].as_str().unwrap().to_string(),
+                change["change"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        described,
+        vec![
+            ("a.txt".to_string(), "modified".to_string()),
+            ("d/f.txt".to_string(), "removed".to_string()),
+            ("d/g.txt".to_string(), "added".to_string()),
+        ],
+        "{changed}"
+    );
+    // The untouched source file is absent: only real changes are named.
+    assert!(
+        changes.iter().all(|change| change["path"] != "Cache.java"),
+        "{changed}"
+    );
+    assert_eq!(changed["state"]["known"], false);
+
+    let text = sandbox.ok(&["state"]);
+    assert!(text.starts_with("state "), "{text}");
+    assert!(
+        text.contains("member cache 1/1 source file(s) parsed"),
+        "{text}"
+    );
+    assert!(text.contains("a.txt [file] modified"), "{text}");
+
+    // Reverting the working tree reproduces the exact original state hash — the hash is a pure
+    // function of the paths, kinds and content, so a settled state can be recognised later.
+    sandbox.write("a.txt", "alpha\n");
+    sandbox.write("d/f.txt", "f\n");
+    sandbox.remove("d/g.txt");
+    sandbox.commit("revert");
+    let reverted = sandbox.json(&["state", "--json"]);
+    assert_eq!(reverted["state"]["state_hash"], state_hash);
+    assert_eq!(reverted["state"]["known"], true);
+    assert_eq!(reverted["state"]["recorded"], false);
+
+    // Comparing against a state this database never recorded is invalid input.
+    let message = sandbox.fails(&["state", "--compare", "tnt1:state:00"], 1);
+    assert!(message.contains("has never been recorded"), "{message}");
 }
