@@ -30,10 +30,11 @@ the dependency set requires) and `git` on `PATH`. SQLite is bundled through
 ```
 treenotes [--repo DIR] [--db PATH] <COMMAND>
 
-treenotes pending [PATH] [--json]
-treenotes read    [PATH] [--depth N] [--json]
-treenotes set     PATH [--note TEXT] [--expected-hash HASH] [--json]
-treenotes import  [FILE|-] [--json]
+treenotes pending    [PATH] [--json]
+treenotes read       [PATH] [--depth N] [--members] [--json]
+treenotes set        PATH [--note TEXT] [--expected-hash HASH] [--ast] [--json]
+treenotes member-set PATH SYMBOL [--note TEXT] [--expected-hash HASH] [--json]
+treenotes import     [FILE|-] [--json]
 ```
 
 Global options:
@@ -58,6 +59,22 @@ Commands:
   `--note`, the one-line note is read from stdin (`printf 'summary\n' | treenotes set src/lib.rs`),
   which avoids shell-quoting friction. `--expected-hash` refuses the write unless the current hash
   still matches, guarding against annotating content that changed while the agent was reading it.
+* `read PATH --members` — additionally list the annotatable declarations *inside* the scoped source
+  files (Java, Rust, TypeScript/TSX, JavaScript and Python). Each member carries its symbol key
+  (`<kind>:<qualified name>:<ordinal>`), its declared and qualified names, its line span, its own
+  `tnt2` hash and its own note status. Scoped non-source files (symlinks, submodules, directories,
+  unsupported extensions) contribute nothing. When a grammar has to recover from a syntax error the
+  members recovered so far are still listed and `parse_error` is `true`, so an agent can distrust
+  the list instead of seeing an empty one.
+* `member-set PATH SYMBOL --note TEXT` — annotate the *current* version of one declaration. With no
+  `--note` the text is read from stdin, as for `set`. `--expected-hash` refuses the write unless the
+  member's current hash still matches, and an unknown symbol (or a file with no AST adapter) is an
+  invalid-input error with the exit code `set` uses. Member notes are independent of file notes:
+  annotating a method does not annotate its file.
+* `set PATH --ast` — after annotating the file itself, re-note every *stale* member of that file
+  with the text of that member's own most recent stored note. Members that were never annotated
+  stay `missing`: `--ast` carries existing summaries forward, it never invents one. `--ast` needs
+  exactly one file, so it is rejected for a directory, symlink or submodule.
 * `import [FILE|-]` — read a JSON array of `{ "path", "hash", "note" }` records (from a file, `-`,
   or stdin when omitted). Every record is validated first: the array must be non-empty, paths must
   be repository-root relative with no `.`/`..`/empty components, duplicates after normalization are
@@ -130,6 +147,14 @@ silently reused.
 | symlink | `tnt1:symlink:H` = BLAKE3(`treenotes-hash-v1\|symlink\0` \|\| link target bytes) |
 | submodule | `tnt1:submodule:H` = BLAKE3(`treenotes-hash-v1\|submodule\0` \|\| index gitlink sha) |
 | directory | `tnt1:dir:H` = BLAKE3(`treenotes-hash-v1\|dir\0` \|\| children) |
+| member | `tnt2:member:H` = BLAKE3(`treenotes-hash-v2\|member\0` \|\| symbol key \|\| `\0` \|\| normalised declaration text) |
+
+Member hashes deliberately use a **different scheme tag** (`tnt2`) because they hash different input:
+not whole working-tree bytes but `symbol_key = <kind>:<qualified name>:<ordinal>` plus the
+declaration's own source text with insignificant whitespace collapsed. Comments are *not* stripped,
+so editing a doc comment re-stales the member — a false-stale is safer than a false-fresh — and
+whitespace inside string literals is preserved. Two different scheme tags never collide, and a note
+bound to one scheme reports as `stale` under the other rather than being reused.
 
 Directory children are encoded unambiguously and deterministically: each child contributes
 `u32-le(name length) || name || kind tag || u32-le(hash length) || hash`, and children are sorted by
@@ -163,11 +188,15 @@ Notes are never garbage-collected in this version; the database grows with annot
 
 ## JSON contract
 
-`--json` prints one versioned envelope. `version` is `1`; it is bumped whenever the shape changes.
+`--json` prints one versioned envelope. `version` is `2`; it is bumped whenever the shape changes.
+Version 2 adds the `members` array (member listing, `set --ast`, `member-set`) and the optional
+`parse_error` flag. Every envelope still carries `entries` exactly as before, and an envelope that
+deals in no members carries an empty `members` array and no `parse_error`, so a consumer that
+ignores unknown fields keeps working.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "tool": "treenotes",
   "command": "read",
   "repository": {
@@ -191,6 +220,23 @@ Notes are never garbage-collected in this version; the database grows with annot
         "updated_at": "2026-09-20T01:10:00Z"
       }
     }
+  ],
+  "members": [
+    {
+      "path": "src/lib.rs",
+      "symbol": "method:Cache.put:0",
+      "symbol_kind": "method",
+      "name": "put",
+      "qualified_name": "Cache.put",
+      "start_line": 12,
+      "end_line": 18,
+      "hash": "tnt2:member:5e...",
+      "status": "missing",
+      "note": null,
+      "note_hash": null,
+      "note_updated_at": null,
+      "previous": null
+    }
   ]
 }
 ```
@@ -205,6 +251,12 @@ Field notes:
   before ancestors with the scope last.
 * `set --json` adds `message`; `import --json` adds `imported` (number of records written) and
   `message`, with one `entries` item per written record.
+* `members` is always present and ordered by path, then start line. `read --members` fills it for the
+  scoped files; `set --ast` and `member-set` report the members they wrote. A member uses the same
+  freshness vocabulary as an entry (`fresh`/`stale`/`missing`, `note`, `previous`), plus `symbol`,
+  `symbol_kind`, `name`, `qualified_name`, `start_line` and `end_line`.
+* `parse_error` appears on `read --members`, `set --ast` and `member-set` and is `true` when at
+  least one scoped source file needed grammar error recovery. It is absent everywhere else.
 * A stale entry carries `note: null` plus the `previous` object, whose `note` is the most recently
   written version of that path and kind. A fresh entry carries `note`, `note_hash` and
   `note_updated_at`. `missing` entries carry neither.
@@ -255,6 +307,13 @@ Re-run `pending` after concurrent edits.
 
 ## Limitations
 
+* AST members exist only for Java, Rust, TypeScript/TSX, JavaScript and Python; other languages have
+  no members until an adapter is added (one module plus one registry entry).
+* Member hashes are `tnt2` and include comments and doc comments, so editing prose re-stales the
+  member. Member ordinals disambiguate overloads and come from document order, so reordering
+  overloaded declarations of the same name re-stales them.
+* A file whose grammar needs error recovery still yields members; `parse_error` marks the listing as
+  untrustworthy rather than hiding it.
 * Submodules are one opaque entry each; nested submodule trees are not inventoried.
 * Symlinks are hashed by target text only; target contents are deliberately never followed.
 * Non-UTF-8 paths and special files abort the scan (exit 2) rather than being silently skipped.
@@ -274,9 +333,13 @@ $ cargo test --all-targets --all-features
 Integration tests in `tests/cli.rs` build real temporary Git repositories (including linked
 worktrees and submodules) and temporary databases; they never touch `~/.tree-notes`.
 
-## Planned: AST/member annotations
+## AST/member annotations
 
-[`docs/ast-annotations-plan.md`](docs/ast-annotations-plan.md) is a research/design document for
-annotating *methods and other declarations inside a file* (Java, Rust, TypeScript/JavaScript and
-Python first, more languages later). It is not implemented: today's behaviour, the `tnt1` hash
-scheme and the `version: 1` JSON envelope are unchanged.
+Methods and other named declarations inside a file can be annotated in Java, Rust,
+TypeScript/TSX, JavaScript and Python: `read PATH --members` lists them, `member-set` annotates one
+of them, and `set PATH --ast` carries a file's existing member summaries forward after an edit.
+Member notes use the `tnt2` hash scheme and live in their own `member_notes` table; the `tnt1`
+file/dir/symlink/submodule scheme and every file note are untouched, and a version-1 database is
+migrated additively. Adding a language is one adapter module plus one registry entry — see
+[`docs/ast-annotations-plan.md`](docs/ast-annotations-plan.md) for the design and the decisions
+still open (comment stripping, ordinal churn, member-vs-file precedence in `pending`).

@@ -9,6 +9,7 @@
 
 use std::fmt;
 
+pub mod ast;
 pub mod cli;
 pub mod output;
 pub mod repo;
@@ -18,10 +19,15 @@ pub mod store;
 pub const PROGRAM: &str = "treenotes";
 
 /// Version of the JSON envelope written by `--json` commands.
-pub const JSON_VERSION: u32 = 1;
+///
+/// Version 2 adds the `members` array (AST member notes) plus the `parse_error` flag; the
+/// `entries` array keeps its version-1 shape.
+pub const JSON_VERSION: u32 = 2;
 
 /// Version of the SQLite schema this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// Version 2 adds the `member_notes` table; version-1 databases are migrated additively.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Exit code: success.
 pub const EXIT_OK: u8 = 0;

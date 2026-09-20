@@ -5,7 +5,7 @@ use std::io::Write;
 use serde::Serialize;
 
 use crate::repo::{depth_within, Entry, Kind};
-use crate::store::NoteVersion;
+use crate::store::{MemberVersion, NoteVersion};
 use crate::{CmdError, JSON_VERSION, PROGRAM};
 
 /// Freshness of a note relative to the current content hash.
@@ -60,6 +60,200 @@ pub struct Previous {
     pub note: String,
     /// Timestamp of the previous note.
     pub updated_at: String,
+}
+
+/// One AST member of a file, paired with the stored member notes of its symbol.
+#[derive(Clone, Debug)]
+pub struct MemberView {
+    /// Repository-root relative path of the file holding the declaration.
+    pub path: String,
+    /// Symbol key, `<symbol-kind>:<qualified name>:<ordinal>`.
+    pub symbol: String,
+    /// treenotes member kind.
+    pub symbol_kind: String,
+    /// Declared name as written.
+    pub name: String,
+    /// Name qualified by its container chain.
+    pub qualified_name: String,
+    /// 1-based first line of the declaration in the current file.
+    pub start_line: usize,
+    /// 1-based last line of the declaration in the current file.
+    pub end_line: usize,
+    /// Current `tnt2:member:<hex>` hash of the declaration.
+    pub hash: String,
+    /// Freshness of the member note for the current hash.
+    pub status: Status,
+    /// Note text for the current hash, when fresh.
+    pub note: Option<String>,
+    /// Hash the displayed note belongs to, when one is displayed.
+    pub note_hash: Option<String>,
+    /// Timestamp of the displayed note, when one is displayed.
+    pub note_updated_at: Option<String>,
+    /// Latest historical note, present only for stale members.
+    pub previous: Option<Previous>,
+}
+
+impl MemberView {
+    /// Combine a freshly parsed member with the stored member notes of its symbol.
+    pub fn build(
+        path: &str,
+        member: &crate::ast::Member,
+        versions: &[MemberVersion],
+    ) -> MemberView {
+        let matching = versions.iter().find(|version| version.hash == member.hash);
+        let latest = versions.first();
+        let (status, note, note_hash, note_updated_at, previous) = match matching {
+            Some(version) => (
+                Status::Fresh,
+                Some(version.note.clone()),
+                Some(version.hash.clone()),
+                Some(version.updated_at.clone()),
+                None,
+            ),
+            None => match latest {
+                Some(version) => (
+                    Status::Stale,
+                    None,
+                    None,
+                    None,
+                    Some(Previous {
+                        hash: version.hash.clone(),
+                        note: version.note.clone(),
+                        updated_at: version.updated_at.clone(),
+                    }),
+                ),
+                None => (Status::Missing, None, None, None, None),
+            },
+        };
+        MemberView {
+            path: path.to_string(),
+            symbol: member.symbol.clone(),
+            symbol_kind: member.symbol_kind.clone(),
+            name: member.name.clone(),
+            qualified_name: member.qualified_name.clone(),
+            start_line: member.start_line,
+            end_line: member.end_line,
+            hash: member.hash.clone(),
+            status,
+            note,
+            note_hash,
+            note_updated_at,
+            previous,
+        }
+    }
+
+    /// Short display form of the current hash (12 hex characters).
+    pub fn short_hash(&self) -> String {
+        hex_of(&self.hash).chars().take(12).collect()
+    }
+
+    /// Text line for one member, indented one level below its file.
+    pub fn text_line(&self, scope: &str) -> String {
+        let indent = "  ".repeat(depth_within(scope, &self.path) + 1);
+        let mut line = format!(
+            "{indent}{} {}:{} [{}] {} {}",
+            self.name,
+            self.symbol_kind,
+            self.symbol
+                .rsplit_once(':')
+                .map(|(_, ordinal)| ordinal)
+                .unwrap_or("0"),
+            self.symbol_kind,
+            self.short_hash(),
+            self.status.as_str()
+        );
+        if let Some(note) = &self.note {
+            line.push_str(&format!(" {}", quote(note)));
+        }
+        line
+    }
+
+    /// Text line naming the previous note of a stale member, labelled as not current.
+    pub fn text_previous_line(&self, scope: &str) -> Option<String> {
+        let previous = self.previous.as_ref()?;
+        let indent = "  ".repeat(depth_within(scope, &self.path) + 2);
+        Some(format!(
+            "{indent}previous (stale, not current): {} {}",
+            previous.hash,
+            quote(&previous.note)
+        ))
+    }
+}
+
+/// JSON form of one AST member.
+#[derive(Debug, Serialize)]
+pub struct MemberJson {
+    /// Repository-root relative path of the file holding the declaration.
+    pub path: String,
+    /// Symbol key.
+    pub symbol: String,
+    /// treenotes member kind.
+    pub symbol_kind: String,
+    /// Declared name as written.
+    pub name: String,
+    /// Name qualified by its container chain.
+    pub qualified_name: String,
+    /// 1-based first line of the declaration.
+    pub start_line: usize,
+    /// 1-based last line of the declaration.
+    pub end_line: usize,
+    /// Current member hash.
+    pub hash: String,
+    /// `fresh`, `stale`, or `missing`.
+    pub status: String,
+    /// Note text for the current hash (null unless fresh).
+    pub note: Option<String>,
+    /// Hash the note belongs to (null unless fresh).
+    pub note_hash: Option<String>,
+    /// Timestamp of the note (null unless fresh).
+    pub note_updated_at: Option<String>,
+    /// Latest historical note, present only when stale.
+    pub previous: Option<PreviousJson>,
+}
+
+impl From<&MemberView> for MemberJson {
+    fn from(view: &MemberView) -> MemberJson {
+        MemberJson {
+            path: view.path.clone(),
+            symbol: view.symbol.clone(),
+            symbol_kind: view.symbol_kind.clone(),
+            name: view.name.clone(),
+            qualified_name: view.qualified_name.clone(),
+            start_line: view.start_line,
+            end_line: view.end_line,
+            hash: view.hash.clone(),
+            status: view.status.as_str().to_string(),
+            note: view.note.clone(),
+            note_hash: view.note_hash.clone(),
+            note_updated_at: view.note_updated_at.clone(),
+            previous: view.previous.as_ref().map(|previous| PreviousJson {
+                hash: previous.hash.clone(),
+                note: previous.note.clone(),
+                updated_at: previous.updated_at.clone(),
+            }),
+        }
+    }
+}
+
+impl MemberJson {
+    /// JSON form of a member note that was just written for the current member version.
+    pub fn from_new(note: &crate::store::NewMemberNote) -> MemberJson {
+        MemberJson {
+            path: note.path.clone(),
+            symbol: note.symbol.clone(),
+            symbol_kind: note.symbol_kind.clone(),
+            name: note.name.clone(),
+            qualified_name: note.qualified_name.clone(),
+            start_line: note.start_line,
+            end_line: note.end_line,
+            hash: note.hash.clone(),
+            status: Status::Fresh.as_str().to_string(),
+            note: Some(note.note.clone()),
+            note_hash: Some(note.hash.clone()),
+            note_updated_at: None,
+            previous: None,
+        }
+    }
 }
 
 impl EntryView {
@@ -294,11 +488,16 @@ pub struct Envelope {
     /// Number of records written, for `import`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imported: Option<usize>,
-    /// Human readable result line, for `set` and `import`.
+    /// Human readable result line, for `set`, `member-set` and `import`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// True when the grammar had to recover from a syntax error in the scoped files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parse_error: Option<bool>,
     /// Deterministically ordered entries.
     pub entries: Vec<EntryJson>,
+    /// Deterministically ordered AST members.
+    pub members: Vec<MemberJson>,
 }
 
 impl Envelope {
@@ -312,7 +511,9 @@ impl Envelope {
             scope: None,
             imported: None,
             message: None,
+            parse_error: None,
             entries: Vec::new(),
+            members: Vec::new(),
         }
     }
 

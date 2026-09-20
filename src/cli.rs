@@ -1,6 +1,6 @@
 //! Command line surface: global options, the four subcommands, and their exit codes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -8,11 +8,13 @@ use std::path::{Component, Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 
+use crate::ast;
 use crate::output::{
-    compare_children_first, depth_key, EntryJson, EntryView, Envelope, RepoJson, ScopeJson, Status,
+    compare_children_first, depth_key, EntryJson, EntryView, Envelope, MemberJson, MemberView,
+    RepoJson, ScopeJson, Status,
 };
 use crate::repo::{in_scope, Entry, Kind, Repo};
-use crate::store::{default_db_path, NewNote, NoteVersion, Store};
+use crate::store::{default_db_path, MemberVersion, NewMemberNote, NewNote, NoteVersion, Store};
 use crate::CmdError;
 
 /// Compact, content-versioned notes for a Git repository.
@@ -48,6 +50,8 @@ enum Command {
     Read(ReadArgs),
     /// Annotate the current version of one file, directory, symlink or submodule.
     Set(SetArgs),
+    /// Annotate the current version of one AST member (declaration) inside a file.
+    MemberSet(MemberSetArgs),
     /// Import a JSON batch of {path, hash, note} records atomically.
     Import(ImportArgs),
 }
@@ -68,6 +72,9 @@ struct ReadArgs {
     /// Show at most this many levels below the scope (0 shows just the scope).
     #[arg(long, value_name = "N")]
     depth: Option<usize>,
+    /// List the annotatable AST members of the scoped files.
+    #[arg(long)]
+    members: bool,
     /// Emit the versioned JSON envelope instead of text.
     #[arg(long)]
     json: bool,
@@ -81,6 +88,26 @@ struct SetArgs {
     #[arg(long, value_name = "TEXT")]
     note: Option<String>,
     /// Reject the write unless the current content hash is exactly this value.
+    #[arg(long, value_name = "HASH")]
+    expected_hash: Option<String>,
+    /// Also re-note every stale member of the scope with that member's own previous note text.
+    #[arg(long)]
+    ast: bool,
+    /// Emit the versioned JSON envelope instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MemberSetArgs {
+    /// File holding the declaration (repository-root relative).
+    path: String,
+    /// Symbol key of the declaration, e.g. `method:Cache.put:0`.
+    symbol: String,
+    /// One-line note text; when omitted the note is read from stdin.
+    #[arg(long, value_name = "TEXT")]
+    note: Option<String>,
+    /// Reject the write unless the current member hash is exactly this value.
     #[arg(long, value_name = "HASH")]
     expected_hash: Option<String>,
     /// Emit the versioned JSON envelope instead of text.
@@ -163,6 +190,7 @@ where
         Command::Pending(args) => cmd_pending(&ctx, args),
         Command::Read(args) => cmd_read(&ctx, args),
         Command::Set(args) => cmd_set(&mut ctx, args),
+        Command::MemberSet(args) => cmd_member_set(&mut ctx, args),
         Command::Import(args) => cmd_import(&mut ctx, args),
     }
 }
@@ -200,6 +228,21 @@ fn cmd_read(ctx: &Ctx, args: ReadArgs) -> Result<(), CmdError> {
     }
     views.sort_by(|a, b| a.path.cmp(&b.path));
 
+    let mut parse_error = false;
+    let mut members: Vec<MemberView> = Vec::new();
+    if args.members {
+        members = scoped_member_views(ctx, &scope, &mut parse_error)?;
+        if let Some(depth) = args.depth {
+            members.retain(|member| depth_key(&scope.path, &member.path) <= depth);
+        }
+        members.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then(a.start_line.cmp(&b.start_line))
+                .then(a.symbol.cmp(&b.symbol))
+        });
+    }
+
     if args.json {
         let mut envelope = Envelope::new("read", repo_json(ctx));
         envelope.scope = Some(ScopeJson {
@@ -208,13 +251,23 @@ fn cmd_read(ctx: &Ctx, args: ReadArgs) -> Result<(), CmdError> {
             depth: args.depth,
         });
         envelope.entries = views.iter().map(EntryJson::from).collect();
+        envelope.members = members.iter().map(MemberJson::from).collect();
+        if args.members {
+            envelope.parse_error = Some(parse_error);
+        }
         return envelope.print();
     }
 
-    let lines: Vec<String> = views
+    let mut lines: Vec<String> = views
         .iter()
         .map(|view| view.text_line(&scope.path))
         .collect();
+    for member in &members {
+        lines.push(member.text_line(&scope.path));
+        if let Some(previous) = member.text_previous_line(&scope.path) {
+            lines.push(previous);
+        }
+    }
     crate::output::print_lines(&lines)
 }
 
@@ -261,6 +314,42 @@ fn cmd_set(ctx: &mut Ctx, args: SetArgs) -> Result<(), CmdError> {
         },
     )?;
 
+    // `--ast` bulk re-note: a stale member whose note text is already known is re-noted for its
+    // current hash, carrying the same text forward. Members that were never annotated keep
+    // `missing`; this never invents a note.
+    let mut parse_error = false;
+    let mut ast_notes: Vec<NewMemberNote> = Vec::new();
+    if args.ast {
+        if entry.kind != Kind::File {
+            return Err(CmdError::usage(format!(
+                "--ast re-notes the members of one file; {} is a {}",
+                entry.path,
+                entry.kind.as_str()
+            )));
+        }
+        let versions = ctx.store.load_member_versions(&ctx.repo.identity)?;
+        let stored = versions.get(&entry.path);
+        for member in parse_members_of(ctx, &entry.path, &mut parse_error)? {
+            let Some(history) = stored.and_then(|stored| stored.get(&member.symbol)) else {
+                continue;
+            };
+            if history.iter().any(|version| version.hash == member.hash) {
+                continue; // already fresh for this exact content
+            }
+            if let Some(previous) = history.first() {
+                ast_notes.push(new_member_note(&member, &entry.path, &previous.note));
+            }
+        }
+        for member_note in &ast_notes {
+            ctx.store
+                .write_member_note(&ctx.repo.identity, member_note)?;
+        }
+    }
+    let ast_suffix = match ast_notes.len() {
+        0 => String::new(),
+        count => format!("; re-noted {count} stale member(s)"),
+    };
+
     if args.json {
         let mut envelope = Envelope::new("set", repo_json(ctx));
         envelope.scope = Some(ScopeJson {
@@ -268,7 +357,7 @@ fn cmd_set(ctx: &mut Ctx, args: SetArgs) -> Result<(), CmdError> {
             kind: entry.kind.as_str().to_string(),
             depth: None,
         });
-        envelope.message = Some(format!("annotated {} (fresh)", entry.path));
+        envelope.message = Some(format!("annotated {} (fresh){ast_suffix}", entry.path));
         envelope.entries = vec![EntryJson::from(&EntryView {
             path: entry.path.clone(),
             kind: entry.kind,
@@ -279,15 +368,165 @@ fn cmd_set(ctx: &mut Ctx, args: SetArgs) -> Result<(), CmdError> {
             note_updated_at: None,
             previous: None,
         })];
+        envelope.members = ast_notes.iter().map(MemberJson::from_new).collect();
+        if args.ast {
+            envelope.parse_error = Some(parse_error);
+        }
+        return envelope.print();
+    }
+
+    crate::output::print_lines(&[format!(
+        "annotated {} [{}] fresh {}{}",
+        entry.path,
+        entry.kind.as_str(),
+        entry.hash,
+        ast_suffix
+    )])
+}
+
+fn cmd_member_set(ctx: &mut Ctx, args: MemberSetArgs) -> Result<(), CmdError> {
+    let note = match &args.note {
+        Some(text) => validate_note(text)?,
+        None => {
+            let mut buffer = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buffer)
+                .map_err(|e| CmdError::env(format!("cannot read the note from stdin: {e}")))?;
+            validate_note(&buffer)?
+        }
+    };
+
+    let (scope, _) = scoped_views(ctx, Some(&args.path))?;
+    let entry = ctx
+        .entries
+        .iter()
+        .find(|entry| entry.path == scope.path)
+        .ok_or_else(|| {
+            CmdError::usage(format!(
+                "{} is not part of the Git-visible tree",
+                scope.path
+            ))
+        })?
+        .clone();
+    if entry.kind != Kind::File {
+        return Err(CmdError::usage(format!(
+            "{} is a {}, not a source file with AST members",
+            entry.path,
+            entry.kind.as_str()
+        )));
+    }
+    if ast::language_for_path(&entry.path).is_none() {
+        return Err(CmdError::usage(format!(
+            "no AST adapter for {}; member notes need a supported source file",
+            entry.path
+        )));
+    }
+    let mut parse_error = false;
+    let members = parse_members_of(ctx, &entry.path, &mut parse_error)?;
+    let member = members
+        .iter()
+        .find(|member| member.symbol == args.symbol)
+        .ok_or_else(|| {
+            CmdError::usage(format!(
+                "{} has no member {}; run `treenotes read {} --members` to list them",
+                entry.path, args.symbol, entry.path
+            ))
+        })?;
+    if let Some(expected) = &args.expected_hash {
+        if expected != &member.hash {
+            return Err(CmdError::usage(format!(
+                "expected hash {} does not match the current hash {} of {} in {}",
+                expected, member.hash, member.symbol, entry.path
+            )));
+        }
+    }
+
+    let written = new_member_note(member, &entry.path, &note);
+    ctx.store.write_member_note(&ctx.repo.identity, &written)?;
+
+    if args.json {
+        let mut envelope = Envelope::new("member-set", repo_json(ctx));
+        envelope.scope = Some(ScopeJson {
+            path: entry.path.clone(),
+            kind: entry.kind.as_str().to_string(),
+            depth: None,
+        });
+        envelope.parse_error = Some(parse_error);
+        envelope.message = Some(format!(
+            "annotated member {} of {} (fresh)",
+            member.symbol, entry.path
+        ));
+        envelope.members = vec![MemberJson::from_new(&written)];
         return envelope.print();
     }
 
     crate::output::print_lines(&[format!(
         "annotated {} [{}] fresh {}",
-        entry.path,
-        entry.kind.as_str(),
-        entry.hash
+        member.symbol, member.symbol_kind, member.hash
     )])
+}
+
+/// Parse one repository-root relative source file into its members.
+///
+/// An unsupported extension is not an error: the file simply has no members. `parse_error` is set
+/// when the grammar had to recover from a syntax error; a file that cannot be read as UTF-8 is an
+/// environment failure.
+fn parse_members_of(
+    ctx: &Ctx,
+    path: &str,
+    parse_error: &mut bool,
+) -> Result<Vec<ast::Member>, CmdError> {
+    let Some(language) = ast::language_for_path(path) else {
+        return Ok(Vec::new());
+    };
+    let absolute = ctx.repo.absolute(path);
+    let source = ast::read_source(&absolute, path)?;
+    let parsed = ast::parse_members(language, &source)?;
+    *parse_error |= parsed.parse_error;
+    Ok(parsed.members)
+}
+
+/// Every AST member of the scoped files, paired with the stored member notes of its symbol.
+fn scoped_member_views(
+    ctx: &Ctx,
+    scope: &Scope,
+    parse_error: &mut bool,
+) -> Result<Vec<MemberView>, CmdError> {
+    let versions = ctx.store.load_member_versions(&ctx.repo.identity)?;
+    let no_notes: BTreeMap<String, Vec<MemberVersion>> = BTreeMap::new();
+    let no_versions: Vec<MemberVersion> = Vec::new();
+    let mut views = Vec::new();
+    for entry in &ctx.entries {
+        // Only regular files are source: symlinks, submodules and directories are never parsed.
+        if entry.kind != Kind::File {
+            continue;
+        }
+        if !in_scope(&entry.path, &scope.path, scope.kind) {
+            continue;
+        }
+        let members = parse_members_of(ctx, &entry.path, parse_error)?;
+        let stored = versions.get(&entry.path).unwrap_or(&no_notes);
+        for member in &members {
+            let history = stored.get(&member.symbol).unwrap_or(&no_versions);
+            views.push(MemberView::build(&entry.path, member, history));
+        }
+    }
+    Ok(views)
+}
+
+/// Build the member-note record for one freshly parsed member.
+fn new_member_note(member: &ast::Member, path: &str, note: &str) -> NewMemberNote {
+    NewMemberNote {
+        path: path.to_string(),
+        symbol: member.symbol.clone(),
+        symbol_kind: member.symbol_kind.clone(),
+        name: member.name.clone(),
+        qualified_name: member.qualified_name.clone(),
+        start_line: member.start_line,
+        end_line: member.end_line,
+        hash: member.hash.clone(),
+        note: note.to_string(),
+    }
 }
 
 fn cmd_import(ctx: &mut Ctx, args: ImportArgs) -> Result<(), CmdError> {

@@ -25,6 +25,62 @@ CREATE INDEX notes_repository_path ON notes (repository, path);
 CREATE INDEX notes_repository_hash ON notes (repository, hash);
 ";
 
+/// Member-note table, created on a fresh database and added by the version 1 -> 2 migration.
+const MEMBER_SCHEMA_SQL: &str = "
+CREATE TABLE member_notes (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository     TEXT NOT NULL,
+    path           TEXT NOT NULL,
+    symbol         TEXT NOT NULL,
+    symbol_kind    TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    start_line     INTEGER NOT NULL,
+    end_line       INTEGER NOT NULL,
+    hash           TEXT NOT NULL,
+    note           TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    UNIQUE (repository, path, symbol, hash)
+);
+CREATE INDEX member_notes_repository_path ON member_notes (repository, path);
+";
+
+/// One stored member-note version.
+#[derive(Clone, Debug)]
+pub struct MemberVersion {
+    /// treenotes member kind the note was written for.
+    pub symbol_kind: String,
+    /// Member hash the note is bound to.
+    pub hash: String,
+    /// One-line note text.
+    pub note: String,
+    /// RFC3339 UTC timestamp of the last write.
+    pub updated_at: String,
+}
+
+/// A member-note version about to be written.
+#[derive(Clone, Debug)]
+pub struct NewMemberNote {
+    /// Repository-root relative path of the file holding the declaration.
+    pub path: String,
+    /// Symbol key, `<symbol-kind>:<qualified name>:<ordinal>`.
+    pub symbol: String,
+    /// treenotes member kind.
+    pub symbol_kind: String,
+    /// Declared name as written.
+    pub name: String,
+    /// Name qualified by its container chain.
+    pub qualified_name: String,
+    /// 1-based first line of the declaration at write time (display metadata).
+    pub start_line: usize,
+    /// 1-based last line of the declaration at write time (display metadata).
+    pub end_line: usize,
+    /// Member hash the note belongs to.
+    pub hash: String,
+    /// One-line note text.
+    pub note: String,
+}
+
 /// One stored note version.
 #[derive(Clone, Debug)]
 pub struct NoteVersion {
@@ -127,6 +183,19 @@ impl Store {
         if version == SCHEMA_VERSION {
             return Ok(());
         }
+        if version == 1 {
+            // Additive migration: a version-1 database keeps every file note and gains the
+            // member-note table. No existing row is rewritten.
+            transaction
+                .execute_batch(MEMBER_SCHEMA_SQL)
+                .map_err(|e| CmdError::env(format!("cannot add the member-note schema: {e}")))?;
+            transaction
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|e| CmdError::env(format!("cannot set the schema version: {e}")))?;
+            return transaction
+                .commit()
+                .map_err(|e| CmdError::env(format!("cannot commit the schema migration: {e}")));
+        }
         if version != 0 {
             return Err(CmdError::env(format!(
                 "database schema version {version} is not supported by this treenotes build (expected {SCHEMA_VERSION})"
@@ -147,6 +216,9 @@ impl Store {
         transaction
             .execute_batch(SCHEMA_SQL)
             .map_err(|e| CmdError::env(format!("cannot create the notes schema: {e}")))?;
+        transaction
+            .execute_batch(MEMBER_SCHEMA_SQL)
+            .map_err(|e| CmdError::env(format!("cannot create the member-note schema: {e}")))?;
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| CmdError::env(format!("cannot set the schema version: {e}")))?;
@@ -194,6 +266,89 @@ impl Store {
             });
         }
         Ok(grouped)
+    }
+
+    /// All member-note versions of one repository, grouped by path then symbol, newest first.
+    pub fn load_member_versions(
+        &self,
+        repository: &str,
+    ) -> Result<BTreeMap<String, BTreeMap<String, Vec<MemberVersion>>>, CmdError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT path, symbol, symbol_kind, hash, note, updated_at FROM member_notes \
+                 WHERE repository = ?1 ORDER BY path ASC, symbol ASC, id DESC",
+            )
+            .map_err(|e| CmdError::env(format!("cannot read member notes: {e}")))?;
+        let rows = statement
+            .query_map([repository], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| CmdError::env(format!("cannot read member notes: {e}")))?;
+        let mut grouped: BTreeMap<String, BTreeMap<String, Vec<MemberVersion>>> = BTreeMap::new();
+        for row in rows {
+            let (path, symbol, symbol_kind, hash, note, updated_at) =
+                row.map_err(|e| CmdError::env(format!("cannot read member notes: {e}")))?;
+            grouped
+                .entry(path)
+                .or_default()
+                .entry(symbol)
+                .or_default()
+                .push(MemberVersion {
+                    symbol_kind,
+                    hash,
+                    note,
+                    updated_at,
+                });
+        }
+        Ok(grouped)
+    }
+
+    /// Write one member-note version.
+    pub fn write_member_note(
+        &mut self,
+        repository: &str,
+        note: &NewMemberNote,
+    ) -> Result<(), CmdError> {
+        let updated_at = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO member_notes (repository, path, symbol, symbol_kind, name, \
+                 qualified_name, start_line, end_line, hash, note, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT (repository, path, symbol, hash) DO UPDATE SET \
+                 id = excluded.id, name = excluded.name, \
+                 qualified_name = excluded.qualified_name, start_line = excluded.start_line, \
+                 end_line = excluded.end_line, note = excluded.note, \
+                 updated_at = excluded.updated_at",
+                rusqlite::params![
+                    repository,
+                    note.path,
+                    note.symbol,
+                    note.symbol_kind,
+                    note.name,
+                    note.qualified_name,
+                    note.start_line as i64,
+                    note.end_line as i64,
+                    note.hash,
+                    note.note,
+                    updated_at
+                ],
+            )
+            .map_err(|e| {
+                CmdError::env(format!(
+                    "cannot store the member note for {} {}: {e}",
+                    note.path, note.symbol
+                ))
+            })
+            .map(|_| ())
     }
 
     /// Write one note version.

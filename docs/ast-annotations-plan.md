@@ -1,8 +1,9 @@
 # Plan: AST-backed method annotations for treenotes
 
-Status: research/design, not implemented. Nothing in this document changes today's behaviour: the
-hash scheme stays `tnt1`, the JSON envelope stays `version: 1`, and `file`/`dir`/`symlink`/
-`submodule` notes keep working exactly as they do now.
+Status: **implemented** (see §11). The `tnt1` file/dir/symlink/submodule scheme, the `notes` table and
+every existing command keep working exactly as before; AST support adds the `tnt2` member scheme,
+the `member_notes` table and JSON envelope `version: 2` with a `members` array. Sections §1-§7
+describe the shipped design and §8's recommendations were all followed as written.
 
 ## 1. What we are adding, and what we are not
 
@@ -433,3 +434,25 @@ These are the choices worth a maintainer's yes/no; each has a cost to change lat
 * Optional per-language opt-in via `~/.tree-notes/config.toml`, if feature-flagged grammars are
   ever introduced.
 * Member-level `import` streaming for repositories large enough that a batch exceeds memory.
+
+## 11. Implementation status (this branch)
+
+* [`src/ast/`](../src/ast) — the language registry plus one adapter module per language (Java, Rust,
+  TypeScript, TSX, JavaScript, Python). Every grammar is pinned to an exact version in `Cargo.toml`:
+  the node kinds each adapter names are a contract, so a grammar bump is a code review.
+* `tnt2` member hashes: `tnt2:member:<hex>` =
+  BLAKE3(`treenotes-hash-v2|member\0` || `symbol_key` || `\0` || normalised body), where
+  `symbol_key` is `<symbol-kind>:<qualified name>:<ordinal>`. Whitespace outside string literals is
+  collapsed; comments are kept (false-stale is the safe direction).
+* `member_notes` table (separate from `notes`, as recommended) with the additive schema `1 -> 2`
+  migration: a version-1 database keeps every file note and gains the member table.
+* JSON envelope `version: 2` with a `members` array and an optional `parse_error` flag; `entries`
+  keeps its version-1 shape.
+* CLI: `read [PATH] --members`, `set PATH --ast` and `member-set PATH SYMBOL [--note TEXT]
+  [--expected-hash HASH] [--json]`.
+* Fixtures in `tests/fixtures/` and integration tests in `tests/cli.rs` cover member listing per
+  language, per-declaration staleness, the hash guard, parse errors, the schema migration and
+  `--ast` carrying summaries forward.
+
+Open for the maintainer, unchanged from §8 and §9: comment/doc-comment stripping, member ordinals
+and overload churn, member-vs-file note precedence in `pending`, and per-language build cost.
