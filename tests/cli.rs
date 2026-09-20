@@ -1980,3 +1980,76 @@ fn state_hashes_the_tree_and_names_only_what_changed() {
     let message = sandbox.fails(&["state", "--compare", "tnt1:state:00"], 1);
     assert!(message.contains("has never been recorded"), "{message}");
 }
+
+#[test]
+fn pending_members_lists_only_missing_and_stale_declarations() {
+    let sandbox = Sandbox::new();
+    let source = fixture("tests/fixtures/java/Cache.java");
+    sandbox.write("Cache.java", &source);
+    sandbox.write("notes.txt", "plain text is not source\n");
+    sandbox.commit("init");
+
+    // Without the flag nothing about `pending` changes: no members, no parse_error.
+    let plain = sandbox.json(&["pending", "--json"]);
+    assert!(plain["members"].as_array().unwrap().is_empty());
+    assert!(plain["parse_error"].is_null());
+
+    // With the flag the tree listing is identical, and every unannotated declaration appears.
+    let json = sandbox.json(&["pending", "--members", "--json"]);
+    assert_eq!(json["version"], 2);
+    assert_eq!(json["command"], "pending");
+    assert_eq!(json["parse_error"], false);
+    assert_eq!(sandbox.paths(&json), sandbox.paths(&plain));
+    assert!(sandbox
+        .members(&json)
+        .iter()
+        .all(|member| member["status"] == "missing"));
+    assert!(sandbox
+        .members(&json)
+        .iter()
+        .any(|member| member["symbol"] == "method:Cache.size:0"));
+
+    // One annotated declaration leaves the list without touching its siblings, and annotating the
+    // file itself does not annotate its declarations.
+    sandbox.ok(&[
+        "member-set",
+        "Cache.java",
+        "method:Cache.size:0",
+        "--note",
+        "cached size",
+    ]);
+    sandbox.annotate("Cache.java", "cache with two size overloads");
+    let json = sandbox.json(&["pending", "--members", "--json"]);
+    // The file note and one declaration are fresh; the other file and its declarations are not.
+    assert!(!sandbox.paths(&json).contains(&"Cache.java".to_string()));
+    assert!(sandbox.paths(&json).contains(&"notes.txt".to_string()));
+    assert!(!sandbox
+        .members(&json)
+        .iter()
+        .any(|member| member["symbol"] == "method:Cache.size:0"));
+    assert!(sandbox
+        .members(&json)
+        .iter()
+        .any(|member| member["symbol"] == "method:Cache.size:1"));
+
+    // Editing one declaration re-stales exactly that one and puts it back in the list.
+    sandbox.write(
+        "Cache.java",
+        &source.replace("return size;", "return this.size;"),
+    );
+    sandbox.commit("edit one method");
+    let json = sandbox.json(&["pending", "--members", "--json"]);
+    let stale = sandbox.member(&json, "method:Cache.size:0");
+    assert_eq!(stale["status"], "stale");
+    assert_eq!(stale["previous"]["note"], "cached size");
+    // The sibling was never annotated at all, so it stays `missing` — untouched by the edit.
+    assert_eq!(
+        sandbox.member(&json, "method:Cache.size:1")["status"],
+        "missing"
+    );
+
+    // Text output names each pending declaration; nothing fresh is printed.
+    let text = sandbox.ok(&["pending", "--members"]);
+    assert!(text.contains("size method:0 [method]"), "{text}");
+    assert!(!text.contains("fresh"), "{text}");
+}

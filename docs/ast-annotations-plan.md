@@ -241,7 +241,7 @@ New subcommand (working name `symbols`), plus `--members` on the existing comman
 treenotes symbols [PATH] [--json]                 # every member of a file, or of every supported
                                                   # file under a directory scope
 
-treenotes member-pending [PATH] [--json]          # members that are `missing` or `stale`
+treenotes pending PATH --members [--json]          # members that are `missing` or `stale`
 
 treenotes member-set PATH SYMBOL [--note TEXT]    # annotate one member
                     [--expected-hash HASH] [--json]
@@ -546,7 +546,10 @@ costs a note.
 
 ### 12.6 What is deliberately *not* here
 
-* No member-level `pending`, and no change to `pending`'s tree-level meaning.
+* `pending --members` is the opt-in member-level listing, and it does not change `pending`'s
+  tree-level meaning: without the flag the output is byte for byte what it was, the flag only
+  appends the `missing`/`stale` declarations of the same scope. There is still no separate
+  `member-pending` subcommand, and no declaration ever appears in `entries`.
 * No reuse of a cached **note**: notes stay bound to hashes through `member_notes` exactly as before.
 * No mtime- or stat-based fast path in the inventory: the scan still hashes every working-tree file
   on every invocation, which is what keeps scoped and unscoped output in agreement.

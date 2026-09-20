@@ -1,4 +1,4 @@
-//! Command line surface: global options, the four subcommands, and their exit codes.
+//! Command line surface: global options, the subcommands, and their exit codes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -46,7 +46,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// List entries that are missing a note or whose note is stale.
+    /// List entries, and with `--members` their declarations, that are missing a note or stale.
     Pending(PendingArgs),
     /// Show the tree, or one file or directory subtree, with note freshness.
     Read(ReadArgs),
@@ -64,6 +64,9 @@ enum Command {
 struct PendingArgs {
     /// Restrict the listing to this path or subtree (repository-root relative).
     path: Option<String>,
+    /// Also list the missing or stale AST members of the scoped files.
+    #[arg(long)]
+    members: bool,
     /// Emit the versioned JSON envelope instead of text.
     #[arg(long)]
     json: bool,
@@ -201,7 +204,7 @@ where
     };
 
     match cli.command {
-        Command::Pending(args) => cmd_pending(&ctx, args),
+        Command::Pending(args) => cmd_pending(&mut ctx, args),
         Command::Read(args) => cmd_read(&mut ctx, args),
         Command::Set(args) => cmd_set(&mut ctx, args),
         Command::MemberSet(args) => cmd_member_set(&mut ctx, args),
@@ -210,10 +213,30 @@ where
     }
 }
 
-fn cmd_pending(ctx: &Ctx, args: PendingArgs) -> Result<(), CmdError> {
+fn cmd_pending(ctx: &mut Ctx, args: PendingArgs) -> Result<(), CmdError> {
     let (scope, mut views) = scoped_views(ctx, args.path.as_deref())?;
     views.retain(|view| view.status != Status::Fresh);
     views.sort_by(|a, b| compare_children_first(&a.path, &b.path));
+
+    // `--members` adds the declaration level below the tree level: a declaration whose note is
+    // missing or belongs to older content is unfinished work too, and without this flag the only
+    // way to see it would be a `read --members` that lists every fresh declaration as well. The
+    // tree listing itself is identical with and without the flag.
+    let mut parse_error = false;
+    let mut members: Vec<MemberView> = Vec::new();
+    if args.members {
+        members = scoped_member_views(ctx, &scope, &mut parse_error)?;
+        members.retain(|member| member.status != Status::Fresh);
+        // Shallowest file first, then file order, then document order inside a file: the same
+        // coarse-to-fine reading the entry listing gives.
+        members.sort_by(|a, b| {
+            depth_key(&scope.path, &a.path)
+                .cmp(&depth_key(&scope.path, &b.path))
+                .then(a.path.cmp(&b.path))
+                .then(a.start_line.cmp(&b.start_line))
+                .then(a.symbol.cmp(&b.symbol))
+        });
+    }
 
     if args.json {
         let mut envelope = Envelope::new("pending", repo_json(ctx));
@@ -223,6 +246,10 @@ fn cmd_pending(ctx: &Ctx, args: PendingArgs) -> Result<(), CmdError> {
             depth: None,
         });
         envelope.entries = views.iter().map(EntryJson::from).collect();
+        envelope.members = members.iter().map(MemberJson::from).collect();
+        if args.members {
+            envelope.parse_error = Some(parse_error);
+        }
         return envelope.print();
     }
 
@@ -230,6 +257,12 @@ fn cmd_pending(ctx: &Ctx, args: PendingArgs) -> Result<(), CmdError> {
     for view in &views {
         lines.push(view.text_line(&scope.path));
         if let Some(previous) = view.text_previous_line(&scope.path) {
+            lines.push(previous);
+        }
+    }
+    for member in &members {
+        lines.push(member.text_line(&scope.path));
+        if let Some(previous) = member.text_previous_line(&scope.path) {
             lines.push(previous);
         }
     }

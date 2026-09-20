@@ -30,7 +30,7 @@ the dependency set requires) and `git` on `PATH`. SQLite is bundled through
 ```
 treenotes [--repo DIR] [--db PATH] <COMMAND>
 
-treenotes pending    [PATH] [--json]
+treenotes pending    [PATH] [--members] [--json]
 treenotes read       [PATH] [--depth N] [--members] [--json]
 treenotes set        PATH [--note TEXT] [--expected-hash HASH] [--ast] [--json]
 treenotes member-set PATH SYMBOL [--note TEXT] [--expected-hash HASH] [--json]
@@ -52,6 +52,12 @@ Commands:
   summarize files first and directories afterwards. Stale entries also show the previous note,
   always labelled as *not current*, together with the hash that note belongs to. Exits 0 even when
   the list is empty.
+* `pending [PATH] --members` — additionally list the `missing` or `stale` declarations inside the
+  scoped source files (the same members `read --members` shows, minus the fresh ones). Entries and
+  members are one list: every entry, then every pending declaration in shallowest-file-first, then
+  file, then document order. `parse_error` is reported for the scope exactly as in `read --members`.
+  This is how an agent finds unannotated methods: a declaration is never mixed into `entries`, and
+  without a pending declaration the members array stays empty.
 * `read [PATH] [--depth N]` — show the tree, or exactly one file, or one directory subtree, with
   freshness for every entry. `--depth 0` shows only the scope itself. Output is an indented text
   map by default, or a versioned JSON envelope with `--json`. Root (`.`) and unannotated entries
