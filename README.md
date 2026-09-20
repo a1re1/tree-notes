@@ -30,10 +30,12 @@ the dependency set requires) and `git` on `PATH`. SQLite is bundled through
 ```
 treenotes [--repo DIR] [--db PATH] <COMMAND>
 
-treenotes pending [PATH] [--json]
-treenotes read    [PATH] [--depth N] [--json]
-treenotes set     PATH [--note TEXT] [--expected-hash HASH] [--json]
-treenotes import  [FILE|-] [--json]
+treenotes pending    [PATH] [--members] [--json]
+treenotes read       [PATH] [--depth N] [--members] [--json]
+treenotes set        PATH [--note TEXT] [--expected-hash HASH] [--ast] [--json]
+treenotes member-set PATH SYMBOL [--note TEXT] [--expected-hash HASH] [--json]
+treenotes import     [FILE|-] [--json]
+treenotes state      [--compare HASH] [--json]
 ```
 
 Global options:
@@ -46,24 +48,57 @@ Global options:
 Commands:
 
 * `pending [PATH]` — list entries under `PATH` (default: the whole repository) that are `missing`
-  or `stale`. The current hash is always shown. Children come before their parents so an agent can
-  summarize files first and directories afterwards. Stale entries also show the previous note,
-  always labelled as *not current*, together with the hash that note belongs to. Exits 0 even when
-  the list is empty.
+  or `stale`. The current hash and note status are always shown. Stale entries also show the previous
+  note, always labelled as *not current*, together with the hash that note belongs to. Exits 0 even
+  when the list is empty — nothing is printed then.
+* `pending [PATH] --members` — additionally list the `missing` or `stale` declarations inside the
+  scoped source files (the same members `read --members` shows, minus the fresh ones). In text output
+  each pending declaration is drawn as a child of the file it was parsed from, in document order.
+  `parse_error` is reported for the scope exactly as in `read --members`. This is how an agent finds
+  unannotated methods: a declaration is never mixed into `entries`, and without a pending declaration
+  the members array stays empty.
 * `read [PATH] [--depth N]` — show the tree, or exactly one file, or one directory subtree, with
-  freshness for every entry. `--depth 0` shows only the scope itself. Output is an indented text
-  map by default, or a versioned JSON envelope with `--json`. Root (`.`) and unannotated entries
-  are always included so coverage gaps stay visible.
+  freshness for every entry. `--depth 0` shows only the scope itself. Text output is one nested
+  ASCII tree — a parent above its children, `│` for levels that continue, `├──` for a child with
+  siblings after it and `└──` for the last one — or a versioned JSON envelope with `--json`. Root
+  (`.`) and unannotated entries are always included so coverage gaps stay visible.
 * `set PATH --note TEXT [--expected-hash HASH]` — annotate the *current* version of `PATH`. With no
   `--note`, the one-line note is read from stdin (`printf 'summary\n' | treenotes set src/lib.rs`),
   which avoids shell-quoting friction. `--expected-hash` refuses the write unless the current hash
   still matches, guarding against annotating content that changed while the agent was reading it.
+* `read PATH --members` — additionally list the annotatable declarations *inside* the scoped source
+  files (Java, Rust, TypeScript/TSX, JavaScript and Python). In text output each declaration is
+  drawn one level below the file it was parsed from, so the nesting repeats what the AST already
+  knows and no parent is ever guessed from a name. Each member carries its symbol key
+  (`<kind>:<qualified name>:<ordinal>`), its declared and qualified names, its line span, its own
+  `tnt2` hash and its own note status. Scoped non-source files (symlinks, submodules, directories,
+  unsupported extensions) contribute nothing. When a grammar has to recover from a syntax error the
+  members recovered so far are still listed and `parse_error` is `true`, so an agent can distrust
+  the list instead of seeing an empty one.
+* `member-set PATH SYMBOL --note TEXT` — annotate the *current* version of one declaration. With no
+  `--note` the text is read from stdin, as for `set`. `--expected-hash` refuses the write unless the
+  member's current hash still matches, and an unknown symbol (or a file with no AST adapter) is an
+  invalid-input error with the exit code `set` uses. Member notes are independent of file notes:
+  annotating a method does not annotate its file.
+* `set PATH --ast` — after annotating the file itself, re-note every *stale* member of that file
+  with the text of that member's own most recent stored note. Members that were never annotated
+  stay `missing`: `--ast` carries existing summaries forward, it never invents one. `--ast` needs
+  exactly one file, so it is rejected for a directory, symlink or submodule.
 * `import [FILE|-]` — read a JSON array of `{ "path", "hash", "note" }` records (from a file, `-`,
   or stdin when omitted). Every record is validated first: the array must be non-empty, paths must
   be repository-root relative with no `.`/`..`/empty components, duplicates after normalization are
   rejected, notes must be non-empty single lines, and every `hash` must equal the *current* hash of
   that path. Only then is the whole batch written in one transaction — one bad record means no
   notes at all are written.
+* `state [--compare HASH]` — report the `tnt1:state` hash of the whole current working tree, the
+  commit it was observed at, whether this database had already recorded that exact state, and how
+  much of the AST member cache would survive a rebuild. By default it is compared against the most
+  recently recorded *different* state; `--compare HASH` compares against one named recorded state.
+  The comparison lists only real leaves: `added`, `modified`, `kind-changed` (a file replaced by a
+  symlink, say) and `removed`, ordered by path. A state this database has not seen is recorded (once)
+  with the current commit and a full entry list, so later runs can name exactly what changed without
+  re-reading anything; re-observing a known state writes nothing. Directories are omitted from the
+  change list because a directory hash moves exactly when one of its leaves does.
 
 ### Path arguments
 
@@ -130,6 +165,15 @@ silently reused.
 | symlink | `tnt1:symlink:H` = BLAKE3(`treenotes-hash-v1\|symlink\0` \|\| link target bytes) |
 | submodule | `tnt1:submodule:H` = BLAKE3(`treenotes-hash-v1\|submodule\0` \|\| index gitlink sha) |
 | directory | `tnt1:dir:H` = BLAKE3(`treenotes-hash-v1\|dir\0` \|\| children) |
+| member | `tnt2:member:H` = BLAKE3(`treenotes-hash-v2\|member\0` \|\| symbol key \|\| `\0` \|\| normalised declaration text) |
+| state | `tnt1:state:H` = BLAKE3(`treenotes-hash-v1\|state\0` \|\| entries) |
+
+Member hashes deliberately use a **different scheme tag** (`tnt2`) because they hash different input:
+not whole working-tree bytes but `symbol_key = <kind>:<qualified name>:<ordinal>` plus the
+declaration's own source text with insignificant whitespace collapsed. Comments are *not* stripped,
+so editing a doc comment re-stales the member — a false-stale is safer than a false-fresh — and
+whitespace inside string literals is preserved. Two different scheme tags never collide, and a note
+bound to one scheme reports as `stale` under the other rather than being reused.
 
 Directory children are encoded unambiguously and deterministically: each child contributes
 `u32-le(name length) || name || kind tag || u32-le(hash length) || hash`, and children are sorted by
@@ -137,11 +181,27 @@ name then kind tag before hashing. Directory hashes are computed bottom-up, so e
 removing or renaming a descendant changes the hashes of its ancestors only — unrelated siblings keep
 their hash, their status and their notes.
 
+State entries are encoded the same way as directory children but over the whole inventory:
+`u32-le(path length) || path || kind tag || u32-le(hash length) || hash`, in path order. The state
+hash is therefore a pure function of what the tree contains — not of Git history — so an unchanged
+checkout always reports the same state, including in another worktree and after an empty commit.
+Recording a state stores that list, which is what makes "what changed since?" a diff between two
+recorded inventories instead of a re-read.
+
 **Cost.** Hashing is O(total bytes) per invocation, streamed and never buffered whole. `read` and
 `pending` re-hash the **entire** inventory even when a scope limits how much output is printed (a
-deliberate trade: no fragile on-disk snapshot cache, and scoped output always agrees with unscoped
-output). A scope bounds the listing, not the scanning; large repositories are dominated by this
-scan regardless of `pending PATH` or `read PATH --depth N`.
+deliberate trade: the hash of a scope always agrees with the hash of the whole tree). A scope bounds
+the listing, not the scanning; large repositories are dominated by this scan regardless of
+`pending PATH` or `read PATH --depth N`.
+
+**The repeated work that is cached** is the *parsing*, not the hashing. `read --members`, `set
+--ast` and `member-set` need the members of a file, and parsing a supported source file is far more
+expensive than hashing it. Members are cached in the database under `(path, file hash)` — the hash
+just computed from the bytes on disk — so a file that did not change is never parsed twice, and an
+edited file misses the cache and is parsed again. The cache is keyed by content, never by
+mtime, and it never caches a *note*: notes stay bound to hashes exactly as before. A `tnt1:state`
+hash answers the coarser question ("has this build already computed this whole tree?") and lets a
+recorded state stand in for the commit a rebuild would otherwise diff against.
 
 ## Note status semantics
 
@@ -163,11 +223,15 @@ Notes are never garbage-collected in this version; the database grows with annot
 
 ## JSON contract
 
-`--json` prints one versioned envelope. `version` is `1`; it is bumped whenever the shape changes.
+`--json` prints one versioned envelope. `version` is `2`; it is bumped whenever the shape changes.
+Version 2 adds the `members` array (member listing, `set --ast`, `member-set`) and the optional
+`parse_error` flag. Every envelope still carries `entries` exactly as before, and an envelope that
+deals in no members carries an empty `members` array and no `parse_error`, so a consumer that
+ignores unknown fields keeps working.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "tool": "treenotes",
   "command": "read",
   "repository": {
@@ -191,6 +255,23 @@ Notes are never garbage-collected in this version; the database grows with annot
         "updated_at": "2026-09-20T01:10:00Z"
       }
     }
+  ],
+  "members": [
+    {
+      "path": "src/lib.rs",
+      "symbol": "method:Cache.put:0",
+      "symbol_kind": "method",
+      "name": "put",
+      "qualified_name": "Cache.put",
+      "start_line": 12,
+      "end_line": 18,
+      "hash": "tnt2:member:5e...",
+      "status": "missing",
+      "note": null,
+      "note_hash": null,
+      "note_updated_at": null,
+      "previous": null
+    }
   ]
 }
 ```
@@ -202,9 +283,17 @@ Field notes:
 * `scope` appears for `pending` and `read` (`path` is `"."` for the whole repository; `kind` is
   `file`/`dir`/`symlink`/`submodule`; `depth` is the requested limit or `null`).
 * `entries` is a deterministic array: `read` orders entries by path; `pending` orders descendants
-  before ancestors with the scope last.
+  before ancestors with the scope last. The text tree is a rendering of the same data, not a second
+  model: `--json` output is unchanged by it, and `members` is always ordered by path, then document
+  order.
 * `set --json` adds `message`; `import --json` adds `imported` (number of records written) and
   `message`, with one `entries` item per written record.
+* `members` is always present and ordered by path, then start line. `read --members` fills it for the
+  scoped files; `set --ast` and `member-set` report the members they wrote. A member uses the same
+  freshness vocabulary as an entry (`fresh`/`stale`/`missing`, `note`, `previous`), plus `symbol`,
+  `symbol_kind`, `name`, `qualified_name`, `start_line` and `end_line`.
+* `parse_error` appears on `read --members`, `set --ast` and `member-set` and is `true` when at
+  least one scoped source file needed grammar error recovery. It is absent everywhere else.
 * A stale entry carries `note: null` plus the `previous` object, whose `note` is the most recently
   written version of that path and kind. A fresh entry carries `note`, `note_hash` and
   `note_updated_at`. `missing` entries carry neither.
@@ -212,6 +301,12 @@ Field notes:
   the records just written — the write the caller just performed is reported back, no timestamp is
   read again — while a subsequent `read`/`pending` of the same fresh entry carries the stored
   `note_updated_at`.
+* `state` appears only on `state --json`. It carries `state_hash`, `commit` (null before the first
+  commit), `known` (this exact state was already recorded), `recorded` (this run wrote it),
+  `member_cache_hits`/`member_cache_misses` (counts of supported source leaves in the tree whose
+  members are or are not already cached), `compared_state` (the recorded state compared against, or
+  `null`) and `changes` (one record per added, modified, kind-changed or removed leaf, ordered by
+  path, each with `hash` and `previous_hash`).
 
 `import` input — one JSON array, all fields required, unknown fields rejected:
 
@@ -255,13 +350,23 @@ Re-run `pending` after concurrent edits.
 
 ## Limitations
 
+* AST members exist only for Java, Rust, TypeScript/TSX, JavaScript and Python; other languages have
+  no members until an adapter is added (one module plus one registry entry).
+* Member hashes are `tnt2` and include comments and doc comments, so editing prose re-stales the
+  member. Member ordinals disambiguate overloads and come from document order, so reordering
+  overloaded declarations of the same name re-stales them.
+* A file whose grammar needs error recovery still yields members; `parse_error` marks the listing as
+  untrustworthy rather than hiding it.
 * Submodules are one opaque entry each; nested submodule trees are not inventoried.
 * Symlinks are hashed by target text only; target contents are deliberately never followed.
 * Non-UTF-8 paths and special files abort the scan (exit 2) rather than being silently skipped.
 * Notes are not garbage-collected; history grows with distinct annotated versions.
 * Linked worktrees share notes; independent clones of the same upstream do not (different common
   directories, therefore different repository identities).
-* Hashing is proportional to the bytes in the tree, on every invocation.
+* Hashing is proportional to the bytes in the tree, on every invocation. The derived member cache
+  removes repeated *parsing*, not the inventory scan, and notes are cached only implicitly (an
+  unchanged file's members are reused, but its note is still resolved from the `member_notes`
+  table).
 
 ## Development
 
@@ -273,3 +378,49 @@ $ cargo test --all-targets --all-features
 
 Integration tests in `tests/cli.rs` build real temporary Git repositories (including linked
 worktrees and submodules) and temporary databases; they never touch `~/.tree-notes`.
+
+## Text trees
+
+`pending` and `read` print one nested ASCII tree per invocation. The scope is the root line, every
+listed entry hangs below its parent directory, and every requested declaration hangs below the file
+it was parsed from:
+
+```text
+. [dir] tnt1:dir:ccf4f86ea580 missing
+├── Cache.java [file] tnt1:file:07a2f172571b missing
+│   ├── Cache class:0 [class] tnt2:member:125515eb9cc7 missing
+│   └── size method:0 [method] tnt2:member:ec4e50e1bd59 missing
+└── lib/service.py [file] tnt1:file:0a5524ee00c6 missing
+    └── run function:0 [function] tnt2:member:7487ed841c20 missing
+```
+
+Two deliberate choices keep the tree honest:
+
+* **Parents first.** The text tree is drawn parent first, so a file always sits above the
+  declarations it owns and a directory above its files; the JSON `entries` array keeps its own
+  documented order (children first for `pending`), because it is a separate contract.
+* **Context lines are never pending work.** A file that was never annotated can still hold
+  unannotated declarations, and a directory on the way to such a file may already be annotated. Both
+  are drawn as `(path) [context]` with no hash and no status, so nothing that needs no attention is
+  presented as if it did, while the declarations below still say exactly where they live.
+
+Stale lines carry their previous note beneath them, always labelled *not current*:
+
+```text
+├── a.txt [file] tnt1:file:fcd2653d2d11 stale
+│   previous (stale, not current): tnt1:file:62e99d22bc3a "first version"
+```
+
+## AST/member annotations
+
+Methods and other named declarations inside a file can be annotated in Java, Rust,
+TypeScript/TSX, JavaScript and Python: `read PATH --members` lists them, `member-set` annotates one
+of them, and `set PATH --ast` carries a file's existing member summaries forward after an edit.
+Member notes use the `tnt2` hash scheme and live in their own `member_notes` table; the `tnt1`
+file/dir/symlink/submodule scheme and every file note are untouched, and older databases are
+migrated additively (schema version 3 adds the derived state tables `snapshots`/`snapshot_entries`
+and the derived member cache `member_index_files`/`member_index` — all four are regenerable and can
+be dropped at any time without losing a note). Adding a language is one adapter module plus one
+registry entry — see
+[`docs/ast-annotations-plan.md`](docs/ast-annotations-plan.md) for the design and the decisions
+still open (comment stripping, ordinal churn, member-vs-file precedence in `pending`).

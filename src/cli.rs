@@ -1,6 +1,6 @@
-//! Command line surface: global options, the four subcommands, and their exit codes.
+//! Command line surface: global options, the subcommands, and their exit codes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -8,11 +8,16 @@ use std::path::{Component, Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 
+use crate::ast;
 use crate::output::{
-    compare_children_first, depth_key, EntryJson, EntryView, Envelope, RepoJson, ScopeJson, Status,
+    build_tree, compare_children_first, depth_key, ComparedStateJson, EntryJson, EntryView,
+    Envelope, MemberJson, MemberView, RepoJson, ScopeJson, StateChangeJson, StateJson, Status,
+    TreeChild,
 };
-use crate::repo::{in_scope, Entry, Kind, Repo};
-use crate::store::{default_db_path, NewNote, NoteVersion, Store};
+use crate::repo::{in_scope, parent_path, state_hash, Entry, Kind, Repo};
+use crate::store::{
+    default_db_path, CachedMember, MemberVersion, NewMemberNote, NewNote, NoteVersion, Store,
+};
 use crate::CmdError;
 
 /// Compact, content-versioned notes for a Git repository.
@@ -42,20 +47,27 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// List entries that are missing a note or whose note is stale.
+    /// List entries, and with `--members` their declarations, that are missing a note or stale.
     Pending(PendingArgs),
     /// Show the tree, or one file or directory subtree, with note freshness.
     Read(ReadArgs),
     /// Annotate the current version of one file, directory, symlink or submodule.
     Set(SetArgs),
+    /// Annotate the current version of one AST member (declaration) inside a file.
+    MemberSet(MemberSetArgs),
     /// Import a JSON batch of {path, hash, note} records atomically.
     Import(ImportArgs),
+    /// Report the hash of the current repository state and what changed since a recorded state.
+    State(StateArgs),
 }
 
 #[derive(Debug, Args)]
 struct PendingArgs {
     /// Restrict the listing to this path or subtree (repository-root relative).
     path: Option<String>,
+    /// Also list the missing or stale AST members of the scoped files.
+    #[arg(long)]
+    members: bool,
     /// Emit the versioned JSON envelope instead of text.
     #[arg(long)]
     json: bool,
@@ -68,6 +80,9 @@ struct ReadArgs {
     /// Show at most this many levels below the scope (0 shows just the scope).
     #[arg(long, value_name = "N")]
     depth: Option<usize>,
+    /// List the annotatable AST members of the scoped files.
+    #[arg(long)]
+    members: bool,
     /// Emit the versioned JSON envelope instead of text.
     #[arg(long)]
     json: bool,
@@ -83,6 +98,36 @@ struct SetArgs {
     /// Reject the write unless the current content hash is exactly this value.
     #[arg(long, value_name = "HASH")]
     expected_hash: Option<String>,
+    /// Also re-note every stale member of the scope with that member's own previous note text.
+    #[arg(long)]
+    ast: bool,
+    /// Emit the versioned JSON envelope instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MemberSetArgs {
+    /// File holding the declaration (repository-root relative).
+    path: String,
+    /// Symbol key of the declaration, e.g. `method:Cache.put:0`.
+    symbol: String,
+    /// One-line note text; when omitted the note is read from stdin.
+    #[arg(long, value_name = "TEXT")]
+    note: Option<String>,
+    /// Reject the write unless the current member hash is exactly this value.
+    #[arg(long, value_name = "HASH")]
+    expected_hash: Option<String>,
+    /// Emit the versioned JSON envelope instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StateArgs {
+    /// Compare against this recorded state hash instead of the most recently recorded state.
+    #[arg(long, value_name = "HASH")]
+    compare: Option<String>,
     /// Emit the versioned JSON envelope instead of text.
     #[arg(long)]
     json: bool,
@@ -160,17 +205,39 @@ where
     };
 
     match cli.command {
-        Command::Pending(args) => cmd_pending(&ctx, args),
-        Command::Read(args) => cmd_read(&ctx, args),
+        Command::Pending(args) => cmd_pending(&mut ctx, args),
+        Command::Read(args) => cmd_read(&mut ctx, args),
         Command::Set(args) => cmd_set(&mut ctx, args),
+        Command::MemberSet(args) => cmd_member_set(&mut ctx, args),
         Command::Import(args) => cmd_import(&mut ctx, args),
+        Command::State(args) => cmd_state(&mut ctx, args),
     }
 }
 
-fn cmd_pending(ctx: &Ctx, args: PendingArgs) -> Result<(), CmdError> {
+fn cmd_pending(ctx: &mut Ctx, args: PendingArgs) -> Result<(), CmdError> {
     let (scope, mut views) = scoped_views(ctx, args.path.as_deref())?;
     views.retain(|view| view.status != Status::Fresh);
     views.sort_by(|a, b| compare_children_first(&a.path, &b.path));
+
+    // `--members` adds the declaration level below the tree level: a declaration whose note is
+    // missing or belongs to older content is unfinished work too, and without this flag the only
+    // way to see it would be a `read --members` that lists every fresh declaration as well. The
+    // tree listing itself is identical with and without the flag.
+    let mut parse_error = false;
+    let mut members: Vec<MemberView> = Vec::new();
+    if args.members {
+        members = scoped_member_views(ctx, &scope, &mut parse_error)?;
+        members.retain(|member| member.status != Status::Fresh);
+        // Shallowest file first, then file order, then document order inside a file: the same
+        // coarse-to-fine reading the entry listing gives.
+        members.sort_by(|a, b| {
+            depth_key(&scope.path, &a.path)
+                .cmp(&depth_key(&scope.path, &b.path))
+                .then(a.path.cmp(&b.path))
+                .then(a.start_line.cmp(&b.start_line))
+                .then(a.symbol.cmp(&b.symbol))
+        });
+    }
 
     if args.json {
         let mut envelope = Envelope::new("pending", repo_json(ctx));
@@ -180,25 +247,44 @@ fn cmd_pending(ctx: &Ctx, args: PendingArgs) -> Result<(), CmdError> {
             depth: None,
         });
         envelope.entries = views.iter().map(EntryJson::from).collect();
+        envelope.members = members.iter().map(MemberJson::from).collect();
+        if args.members {
+            envelope.parse_error = Some(parse_error);
+        }
         return envelope.print();
     }
 
-    let mut lines = Vec::new();
-    for view in &views {
-        lines.push(view.text_line(&scope.path));
-        if let Some(previous) = view.text_previous_line(&scope.path) {
-            lines.push(previous);
-        }
-    }
-    crate::output::print_lines(&lines)
+    // The text tree is drawn parent first so a file always sits above its declarations and a
+    // directory above its files; the JSON `entries` array keeps its documented children-first
+    // order, so `--json` output is unchanged by this rendering.
+    let mut by_path = views.clone();
+    by_path.sort_by(|a, b| a.path.cmp(&b.path));
+    crate::output::print_lines(&tree_lines(&scope, &by_path, &members)?)
 }
 
-fn cmd_read(ctx: &Ctx, args: ReadArgs) -> Result<(), CmdError> {
+fn cmd_read(ctx: &mut Ctx, args: ReadArgs) -> Result<(), CmdError> {
+    // `--members` may fill the derived member cache, so the whole command takes a mutable context
+    // even though the note tables are only read.
     let (scope, mut views) = scoped_views(ctx, args.path.as_deref())?;
     if let Some(depth) = args.depth {
         views.retain(|view| depth_key(&scope.path, &view.path) <= depth);
     }
     views.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut parse_error = false;
+    let mut members: Vec<MemberView> = Vec::new();
+    if args.members {
+        members = scoped_member_views(ctx, &scope, &mut parse_error)?;
+        if let Some(depth) = args.depth {
+            members.retain(|member| depth_key(&scope.path, &member.path) <= depth);
+        }
+        members.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then(a.start_line.cmp(&b.start_line))
+                .then(a.symbol.cmp(&b.symbol))
+        });
+    }
 
     if args.json {
         let mut envelope = Envelope::new("read", repo_json(ctx));
@@ -208,14 +294,14 @@ fn cmd_read(ctx: &Ctx, args: ReadArgs) -> Result<(), CmdError> {
             depth: args.depth,
         });
         envelope.entries = views.iter().map(EntryJson::from).collect();
+        envelope.members = members.iter().map(MemberJson::from).collect();
+        if args.members {
+            envelope.parse_error = Some(parse_error);
+        }
         return envelope.print();
     }
 
-    let lines: Vec<String> = views
-        .iter()
-        .map(|view| view.text_line(&scope.path))
-        .collect();
-    crate::output::print_lines(&lines)
+    crate::output::print_lines(&tree_lines(&scope, &views, &members)?)
 }
 
 fn cmd_set(ctx: &mut Ctx, args: SetArgs) -> Result<(), CmdError> {
@@ -261,6 +347,43 @@ fn cmd_set(ctx: &mut Ctx, args: SetArgs) -> Result<(), CmdError> {
         },
     )?;
 
+    // `--ast` bulk re-note: a stale member whose note text is already known is re-noted for its
+    // current hash, carrying the same text forward. Members that were never annotated keep
+    // `missing`; this never invents a note.
+    let mut parse_error = false;
+    let mut ast_notes: Vec<NewMemberNote> = Vec::new();
+    if args.ast {
+        if entry.kind != Kind::File {
+            return Err(CmdError::usage(format!(
+                "--ast re-notes the members of one file; {} is a {}",
+                entry.path,
+                entry.kind.as_str()
+            )));
+        }
+        let members = parse_members_of(ctx, &entry.path, &mut parse_error)?;
+        let versions = ctx.store.load_member_versions(&ctx.repo.identity)?;
+        let stored = versions.get(&entry.path);
+        for member in members {
+            let Some(history) = stored.and_then(|stored| stored.get(&member.symbol)) else {
+                continue;
+            };
+            if history.iter().any(|version| version.hash == member.hash) {
+                continue; // already fresh for this exact content
+            }
+            if let Some(previous) = history.first() {
+                ast_notes.push(new_member_note(&member, &entry.path, &previous.note));
+            }
+        }
+        for member_note in &ast_notes {
+            ctx.store
+                .write_member_note(&ctx.repo.identity, member_note)?;
+        }
+    }
+    let ast_suffix = match ast_notes.len() {
+        0 => String::new(),
+        count => format!("; re-noted {count} stale member(s)"),
+    };
+
     if args.json {
         let mut envelope = Envelope::new("set", repo_json(ctx));
         envelope.scope = Some(ScopeJson {
@@ -268,7 +391,7 @@ fn cmd_set(ctx: &mut Ctx, args: SetArgs) -> Result<(), CmdError> {
             kind: entry.kind.as_str().to_string(),
             depth: None,
         });
-        envelope.message = Some(format!("annotated {} (fresh)", entry.path));
+        envelope.message = Some(format!("annotated {} (fresh){ast_suffix}", entry.path));
         envelope.entries = vec![EntryJson::from(&EntryView {
             path: entry.path.clone(),
             kind: entry.kind,
@@ -279,15 +402,411 @@ fn cmd_set(ctx: &mut Ctx, args: SetArgs) -> Result<(), CmdError> {
             note_updated_at: None,
             previous: None,
         })];
+        envelope.members = ast_notes.iter().map(MemberJson::from_new).collect();
+        if args.ast {
+            envelope.parse_error = Some(parse_error);
+        }
+        return envelope.print();
+    }
+
+    crate::output::print_lines(&[format!(
+        "annotated {} [{}] fresh {}{}",
+        entry.path,
+        entry.kind.as_str(),
+        entry.hash,
+        ast_suffix
+    )])
+}
+
+fn cmd_member_set(ctx: &mut Ctx, args: MemberSetArgs) -> Result<(), CmdError> {
+    let note = match &args.note {
+        Some(text) => validate_note(text)?,
+        None => {
+            let mut buffer = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buffer)
+                .map_err(|e| CmdError::env(format!("cannot read the note from stdin: {e}")))?;
+            validate_note(&buffer)?
+        }
+    };
+
+    let (scope, _) = scoped_views(ctx, Some(&args.path))?;
+    let entry = ctx
+        .entries
+        .iter()
+        .find(|entry| entry.path == scope.path)
+        .ok_or_else(|| {
+            CmdError::usage(format!(
+                "{} is not part of the Git-visible tree",
+                scope.path
+            ))
+        })?
+        .clone();
+    if entry.kind != Kind::File {
+        return Err(CmdError::usage(format!(
+            "{} is a {}, not a source file with AST members",
+            entry.path,
+            entry.kind.as_str()
+        )));
+    }
+    if ast::language_for_path(&entry.path).is_none() {
+        return Err(CmdError::usage(format!(
+            "no AST adapter for {}; member notes need a supported source file",
+            entry.path
+        )));
+    }
+    let mut parse_error = false;
+    let members = parse_members_of(ctx, &entry.path, &mut parse_error)?;
+    let member = members
+        .iter()
+        .find(|member| member.symbol == args.symbol)
+        .ok_or_else(|| {
+            CmdError::usage(format!(
+                "{} has no member {}; run `treenotes read {} --members` to list them",
+                entry.path, args.symbol, entry.path
+            ))
+        })?;
+    if let Some(expected) = &args.expected_hash {
+        if expected != &member.hash {
+            return Err(CmdError::usage(format!(
+                "expected hash {} does not match the current hash {} of {} in {}",
+                expected, member.hash, member.symbol, entry.path
+            )));
+        }
+    }
+
+    let written = new_member_note(member, &entry.path, &note);
+    ctx.store.write_member_note(&ctx.repo.identity, &written)?;
+
+    if args.json {
+        let mut envelope = Envelope::new("member-set", repo_json(ctx));
+        envelope.scope = Some(ScopeJson {
+            path: entry.path.clone(),
+            kind: entry.kind.as_str().to_string(),
+            depth: None,
+        });
+        envelope.parse_error = Some(parse_error);
+        envelope.message = Some(format!(
+            "annotated member {} of {} (fresh)",
+            member.symbol, entry.path
+        ));
+        envelope.members = vec![MemberJson::from_new(&written)];
         return envelope.print();
     }
 
     crate::output::print_lines(&[format!(
         "annotated {} [{}] fresh {}",
-        entry.path,
-        entry.kind.as_str(),
-        entry.hash
+        member.symbol, member.symbol_kind, member.hash
     )])
+}
+
+/// Parse one repository-root relative source file into its members.
+///
+/// An unsupported extension is not an error: the file simply has no members. `parse_error` is set
+/// when the grammar had to recover from a syntax error; a file that cannot be read as UTF-8 is an
+/// environment failure.
+///
+/// The result is cached in the derived `member_index` tables under the file's own content hash, so
+/// a file whose bytes have not changed is never parsed twice — parsing is the expensive part of
+/// `read --members`, and the cache is what makes repeating it cheap. A cache hit is not an
+/// assumption about the bytes: it is keyed by the hash the inventory just computed for the bytes on
+/// disk, so an edited file misses and is parsed again.
+fn parse_members_of(
+    ctx: &mut Ctx,
+    path: &str,
+    parse_error: &mut bool,
+) -> Result<Vec<ast::Member>, CmdError> {
+    let Some(language) = ast::language_for_path(path) else {
+        return Ok(Vec::new());
+    };
+    let file_hash = ctx
+        .entries
+        .iter()
+        .find(|entry| entry.path == path)
+        .map(|entry| entry.hash.clone())
+        .ok_or_else(|| CmdError::usage(format!("{path} is not part of the Git-visible tree")))?;
+    if let Some((cached_error, cached)) =
+        ctx.store
+            .load_member_index(&ctx.repo.identity, path, &file_hash)?
+    {
+        *parse_error |= cached_error;
+        return Ok(cached.iter().map(member_from_cached).collect());
+    }
+    let absolute = ctx.repo.absolute(path);
+    let source = ast::read_source(&absolute, path)?;
+    let parsed = ast::parse_members(language, &source)?;
+    *parse_error |= parsed.parse_error;
+    let cached: Vec<CachedMember> = parsed.members.iter().map(cached_member_of).collect();
+    ctx.store.store_member_index(
+        &ctx.repo.identity,
+        path,
+        &file_hash,
+        parsed.parse_error,
+        &cached,
+    )?;
+    Ok(parsed.members)
+}
+
+/// The cache record for a freshly parsed member.
+fn cached_member_of(member: &ast::Member) -> CachedMember {
+    CachedMember {
+        symbol: member.symbol.clone(),
+        symbol_kind: member.symbol_kind.clone(),
+        name: member.name.clone(),
+        qualified_name: member.qualified_name.clone(),
+        start_line: member.start_line,
+        end_line: member.end_line,
+        hash: member.hash.clone(),
+    }
+}
+
+/// The member a cache record describes, indistinguishable from the parsed original.
+fn member_from_cached(cached: &CachedMember) -> ast::Member {
+    ast::Member {
+        symbol: cached.symbol.clone(),
+        symbol_kind: cached.symbol_kind.clone(),
+        name: cached.name.clone(),
+        qualified_name: cached.qualified_name.clone(),
+        start_line: cached.start_line,
+        end_line: cached.end_line,
+        hash: cached.hash.clone(),
+    }
+}
+
+/// Every AST member of the scoped files, paired with the stored member notes of its symbol.
+fn scoped_member_views(
+    ctx: &mut Ctx,
+    scope: &Scope,
+    parse_error: &mut bool,
+) -> Result<Vec<MemberView>, CmdError> {
+    let versions = ctx.store.load_member_versions(&ctx.repo.identity)?;
+    let no_notes: BTreeMap<String, Vec<MemberVersion>> = BTreeMap::new();
+    let no_versions: Vec<MemberVersion> = Vec::new();
+    // Only regular files are source: symlinks, submodules and directories are never parsed. The
+    // paths are collected first so parsing (which fills the cache through `ctx`) can borrow the
+    // context mutably while this loop walks an owned list.
+    let paths: Vec<String> = ctx
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == Kind::File)
+        .filter(|entry| in_scope(&entry.path, &scope.path, scope.kind))
+        .map(|entry| entry.path.clone())
+        .collect();
+    let mut views = Vec::new();
+    for path in paths {
+        let members = parse_members_of(ctx, &path, parse_error)?;
+        let stored = versions.get(&path).unwrap_or(&no_notes);
+        for member in &members {
+            let history = stored.get(&member.symbol).unwrap_or(&no_versions);
+            views.push(MemberView::build(&path, member, history));
+        }
+    }
+    Ok(views)
+}
+
+/// Build the member-note record for one freshly parsed member.
+fn new_member_note(member: &ast::Member, path: &str, note: &str) -> NewMemberNote {
+    NewMemberNote {
+        path: path.to_string(),
+        symbol: member.symbol.clone(),
+        symbol_kind: member.symbol_kind.clone(),
+        name: member.name.clone(),
+        qualified_name: member.qualified_name.clone(),
+        start_line: member.start_line,
+        end_line: member.end_line,
+        hash: member.hash.clone(),
+        note: note.to_string(),
+    }
+}
+
+/// Report the aggregate hash of the current tree state, whether this build has already computed
+/// it, how much of the AST member cache survives, and what changed since a recorded state.
+///
+/// The state hash is a pure function of the inventory, so an unchanged checkout always reports the
+/// same hash — including on another worktree or after a branch switch that lands on identical
+/// bytes. Recording it (once: an already-known state is not rewritten) is what lets a later run
+/// name exactly which files changed instead of re-reading the tree.
+fn cmd_state(ctx: &mut Ctx, args: StateArgs) -> Result<(), CmdError> {
+    let current = state_hash(&ctx.entries);
+    let commit = ctx.repo.head_commit()?;
+    let known = ctx
+        .store
+        .snapshot_info(&ctx.repo.identity, &current)?
+        .is_some();
+
+    // Member-cache accounting: one database query, then one pass over the inventory.
+    let cached = ctx.store.member_index_keys(&ctx.repo.identity)?;
+    let mut member_cache_hits = 0_usize;
+    let mut member_cache_misses = 0_usize;
+    for entry in &ctx.entries {
+        if entry.kind != Kind::File || ast::language_for_path(&entry.path).is_none() {
+            continue;
+        }
+        if cached.contains(&(entry.path.clone(), entry.hash.clone())) {
+            member_cache_hits += 1;
+        } else {
+            member_cache_misses += 1;
+        }
+    }
+
+    let compared =
+        match &args.compare {
+            Some(state) => Some(ctx.store.snapshot(&ctx.repo.identity, state)?.ok_or_else(
+                || {
+                    CmdError::usage(format!(
+                        "state {state} has never been recorded by this database; run `treenotes \
+                         state` on the checkout you want to compare with"
+                    ))
+                },
+            )?),
+            None => ctx
+                .store
+                .latest_snapshot(&ctx.repo.identity, Some(&current))?,
+        };
+    let changes = match &compared {
+        Some((_, entries)) => state_changes(&ctx.entries, entries),
+        None => Vec::new(),
+    };
+    // Only a state this build has not seen is written: an unchanged `state` run stays read-only,
+    // and the commit a state was first observed at is not rewritten by later observations.
+    let recorded = if known {
+        false
+    } else {
+        ctx.store.record_snapshot(
+            &ctx.repo.identity,
+            &current,
+            commit.as_deref(),
+            &ctx.entries,
+        )?;
+        true
+    };
+
+    if args.json {
+        let mut envelope = Envelope::new("state", repo_json(ctx));
+        envelope.state = Some(StateJson {
+            state_hash: current,
+            commit,
+            known,
+            recorded,
+            member_cache_hits,
+            member_cache_misses,
+            compared_state: compared.as_ref().map(|(info, _)| ComparedStateJson {
+                state_hash: info.state_hash.clone(),
+                commit: info.commit.clone(),
+                updated_at: info.updated_at.clone(),
+            }),
+            changes,
+        });
+        return envelope.print();
+    }
+
+    let mut lines = vec![format!(
+        "state {} [{}] {}",
+        short_hash(&current),
+        if known { "known" } else { "new" },
+        match &commit {
+            Some(commit) => format!("commit {}", short_hash(commit)),
+            None => "no commit yet".to_string(),
+        }
+    )];
+    lines.push(format!(
+        "member cache {}/{} source file(s) parsed",
+        member_cache_hits,
+        member_cache_hits + member_cache_misses
+    ));
+    match &compared {
+        Some((info, _)) => {
+            lines.push(format!(
+                "compared with {} ({} change(s))",
+                short_hash(&info.state_hash),
+                changes.len()
+            ));
+            for change in &changes {
+                lines.push(format!(
+                    "  {} [{}] {}{}",
+                    change.path,
+                    change.kind,
+                    change.change,
+                    match &change.hash {
+                        Some(hash) => format!(" {}", short_hash(hash)),
+                        None => String::new(),
+                    }
+                ));
+            }
+        }
+        None => lines.push("no earlier recorded state to compare with".to_string()),
+    }
+    crate::output::print_lines(&lines)
+}
+
+/// Entry-level differences between the current tree and one recorded state.
+///
+/// Directories are skipped: a directory hash is a function of its children's hashes, so a changed
+/// directory is always accompanied by a changed leaf and would only add noise. Paths are compared,
+/// not positions, so a rename is one removal plus one addition and never a rebinding.
+fn state_changes(current: &[Entry], recorded: &[(String, String, String)]) -> Vec<StateChangeJson> {
+    let previous: BTreeMap<&str, (&str, &str)> = recorded
+        .iter()
+        .map(|(path, kind, hash)| (path.as_str(), (kind.as_str(), hash.as_str())))
+        .collect();
+    let mut changes = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for entry in current {
+        seen.insert(entry.path.as_str());
+        if entry.kind == Kind::Dir {
+            continue;
+        }
+        let kind = entry.kind.as_str();
+        match previous.get(entry.path.as_str()).copied() {
+            None => changes.push(StateChangeJson {
+                path: entry.path.clone(),
+                kind: kind.to_string(),
+                change: "added".to_string(),
+                hash: Some(entry.hash.clone()),
+                previous_hash: None,
+                previous_kind: None,
+            }),
+            Some((old_kind, old_hash)) => {
+                if old_kind == kind && old_hash == entry.hash {
+                    continue;
+                }
+                let kind_changed = old_kind != kind;
+                changes.push(StateChangeJson {
+                    path: entry.path.clone(),
+                    kind: kind.to_string(),
+                    change: if kind_changed {
+                        "kind-changed"
+                    } else {
+                        "modified"
+                    }
+                    .to_string(),
+                    hash: Some(entry.hash.clone()),
+                    previous_hash: Some(old_hash.to_string()),
+                    previous_kind: kind_changed.then(|| old_kind.to_string()),
+                });
+            }
+        }
+    }
+    for (path, kind, hash) in recorded {
+        if kind == Kind::Dir.as_str() || seen.contains(path.as_str()) {
+            continue;
+        }
+        changes.push(StateChangeJson {
+            path: path.clone(),
+            kind: kind.clone(),
+            change: "removed".to_string(),
+            hash: None,
+            previous_hash: Some(hash.clone()),
+            previous_kind: None,
+        });
+    }
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    changes
+}
+
+/// Hex part of a hash string, truncated for display.
+fn short_hash(hash: &str) -> String {
+    crate::output::hex_of(hash).chars().take(12).collect()
 }
 
 fn cmd_import(ctx: &mut Ctx, args: ImportArgs) -> Result<(), CmdError> {
@@ -367,6 +886,112 @@ fn cmd_import(ctx: &mut Ctx, args: ImportArgs) -> Result<(), CmdError> {
     }
 
     crate::output::print_lines(&[format!("imported {count} notes")])
+}
+
+/// One nested ASCII tree of a listing: every entry with the declarations that belong to it.
+///
+/// Both slices must be in path order, with each file's declarations grouped and kept in document
+/// order. Anything that only *locates* the rest — an ancestor directory, or a file that holds
+/// listed declarations but is not itself unfinished — is drawn as `(path) [context]` without a
+/// hash or a status, so a fresh file is never presented as pending work.
+fn tree_lines(
+    scope: &Scope,
+    views: &[EntryView],
+    members: &[MemberView],
+) -> Result<Vec<String>, CmdError> {
+    let mut listed: BTreeMap<&str, &EntryView> = BTreeMap::new();
+    for view in views {
+        listed.insert(view.path.as_str(), view);
+    }
+    let mut grouped: BTreeMap<&str, Vec<&MemberView>> = BTreeMap::new();
+    for member in members {
+        grouped
+            .entry(member.path.as_str())
+            .or_default()
+            .push(member);
+    }
+    let mut paths: BTreeSet<&str> = listed.keys().copied().collect();
+    paths.extend(grouped.keys().copied());
+
+    let mut children: Vec<(Option<String>, TreeChild)> = Vec::new();
+    // A label per path that has already been drawn, so a child can name the node it hangs from.
+    let mut labels: BTreeMap<&str, &str> = BTreeMap::new();
+    match listed.get(scope.path.as_str()) {
+        Some(view) => {
+            children.push((None, TreeChild::Entry((*view).clone())));
+            if let Some(previous) = view.previous_body() {
+                children.push((Some(view.path.clone()), TreeChild::Detail(previous)));
+            }
+        }
+        None => children.push((None, TreeChild::Context(scope.path.clone()))),
+    }
+    labels.insert(scope.path.as_str(), scope.path.as_str());
+
+    for path in paths {
+        if path != scope.path.as_str() {
+            match listed.get(path) {
+                Some(view) => {
+                    children.push((
+                        nearest_label(&labels, path),
+                        TreeChild::Entry((*view).clone()),
+                    ));
+                    labels.insert(path, path);
+                    if let Some(previous) = view.previous_body() {
+                        children.push((Some(path.to_string()), TreeChild::Detail(previous)));
+                    }
+                }
+                None => {
+                    // A declaration whose file is not itself listed: draw the file and every
+                    // ancestor that is missing as context, top down.
+                    let mut chain: Vec<&str> = vec![path];
+                    let mut parent = parent_path(path);
+                    while !labels.contains_key(parent) {
+                        chain.push(parent);
+                        parent = parent_path(parent);
+                    }
+                    for context in chain.iter().rev() {
+                        children.push((
+                            nearest_label(&labels, context),
+                            TreeChild::Context((*context).to_string()),
+                        ));
+                        labels.insert(context, context);
+                    }
+                }
+            }
+        }
+        if let Some(group) = grouped.get(path) {
+            let owner = labels.get(path).copied().unwrap_or(scope.path.as_str());
+            for member in group {
+                children.push((
+                    Some(owner.to_string()),
+                    TreeChild::Member((*member).clone()),
+                ));
+                if let Some(previous) = member.previous_body() {
+                    children.push((Some(member.symbol.clone()), TreeChild::Detail(previous)));
+                }
+            }
+        }
+    }
+    // A scope that needs nothing drawn is not a tree: printing only the scope as context would
+    // turn an empty `pending` into a line that looks like an entry.
+    if children.len() == 1 && matches!(children[0].1, TreeChild::Context(_)) {
+        return Ok(Vec::new());
+    }
+    build_tree(&children)
+}
+
+/// Label of the closest already drawn ancestor of `path`.
+fn nearest_label<'a>(labels: &BTreeMap<&'a str, &'a str>, path: &str) -> Option<String> {
+    let mut parent = parent_path(path);
+    loop {
+        if let Some(label) = labels.get(parent) {
+            return Some((*label).to_string());
+        }
+        if parent == "." {
+            return None;
+        }
+        parent = parent_path(parent);
+    }
 }
 
 /// Current entries within a path scope, paired with their stored note versions.

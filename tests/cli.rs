@@ -402,6 +402,7 @@ fn status_is_missing_then_fresh_then_stale_then_fresh_again() {
 
     let pending_text = sandbox.ok(&["pending", "a.txt"]);
     assert!(pending_text.contains("stale"), "{pending_text}");
+    assert!(pending_text.contains("previous (stale"), "{pending_text}");
     assert!(
         pending_text.contains("previous (stale, not current)"),
         "{pending_text}"
@@ -723,7 +724,7 @@ fn pending_orders_children_before_parents_and_omits_fresh_entries() {
         sandbox.paths(&json),
         vec!["a.txt", "d/f.txt", "d/g.txt", "d", "."]
     );
-    assert_eq!(json["version"], 1);
+    assert_eq!(json["version"], 2);
     assert_eq!(json["tool"], "treenotes");
     assert_eq!(json["command"], "pending");
     assert_eq!(json["scope"]["path"], ".");
@@ -805,8 +806,20 @@ fn read_scopes_depth_and_subdirectory_invocation() {
     let text = sandbox.ok(&["read", "lib"]);
     let lines = text_lines(&text);
     assert!(lines[0].starts_with("lib [dir]"), "{lines:?}");
-    assert!(lines[1].starts_with("  lib/b.txt [file]"), "{lines:?}");
-    assert!(lines.iter().any(|line| line.contains("\"beta note\"")));
+    assert!(
+        !lines[0].starts_with([' ', '│', '├', '└']),
+        "the scope is the tree root and is never indented: {lines:?}"
+    );
+    // Every other line is drawn with a branch connector, so nesting is always visible.
+    assert!(
+        lines[1..].iter().all(|line| line.contains("── ")),
+        "{lines:?}"
+    );
+    assert!(lines[1].starts_with("├── lib/b.txt [file]"), "{lines:?}");
+    assert!(
+        lines.iter().any(|line| line.contains("\"beta note\"")),
+        "{lines:?}"
+    );
 
     // The absolute path of the repository root is the root scope.
     let json = sandbox.json(&["read", sandbox.repo.to_str().unwrap(), "--json"]);
@@ -1432,7 +1445,7 @@ fn concurrent_fresh_processes_initialize_one_schema() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 1, "schema version after concurrent initialization");
+    assert_eq!(version, 3, "schema version after concurrent initialization");
     let count: i64 = conn
         .query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
         .unwrap();
@@ -1492,4 +1505,644 @@ fn default_database_location_can_be_redirected_with_global_flags() {
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     assert!(!out.stderr.is_empty());
+}
+
+// -------------------------------------------------------------------------------------------
+// AST members
+// -------------------------------------------------------------------------------------------
+
+/// Read one checked-in fixture exactly as the repository stores it.
+fn fixture(rel: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+impl Sandbox {
+    fn members(&self, json: &Value) -> Vec<Value> {
+        json["members"].as_array().expect("members array").clone()
+    }
+
+    fn member(&self, json: &Value, symbol: &str) -> Value {
+        self.members(json)
+            .into_iter()
+            .find(|member| member["symbol"] == symbol)
+            .unwrap_or_else(|| panic!("no member {symbol} in {json}"))
+    }
+}
+
+#[test]
+fn ast_members_are_listed_for_source_files_only() {
+    let sandbox = Sandbox::new();
+    sandbox.write("Cache.java", &fixture("tests/fixtures/java/Cache.java"));
+    sandbox.write("store.rs", &fixture("tests/fixtures/rust/store.rs"));
+    sandbox.write("lib/inner.py", &fixture("tests/fixtures/python/service.py"));
+    sandbox.write("notes.txt", "plain text is not source\n");
+    sandbox.commit("init");
+
+    let json = sandbox.json(&["read", "--members", "--json"]);
+    assert_eq!(json["version"], 2);
+    assert_eq!(json["command"], "read");
+    assert_eq!(json["parse_error"], false);
+    assert!(!sandbox.members(&json).is_empty());
+    assert!(
+        sandbox
+            .members(&json)
+            .iter()
+            .all(|member| member["status"] == "missing"),
+        "members start out unannotated"
+    );
+    for expected in [
+        "class:Cache:0",
+        "field:Cache.size:0",
+        "method:Cache.size:0",
+        "method:Cache.size:1",
+        "constructor:Cache.Cache:0",
+        "method:Cache.Inner.go:0",
+        "constant:Mode.FAST:0",
+        "record:Point:0",
+        "function:Cache::new:0",
+        "impl:Cache:0",
+        "function:inner::deep:0",
+        "function:plain.nested:0",
+        "function:Service.run:0",
+    ] {
+        let member = sandbox.member(&json, expected);
+        assert!(
+            !member["symbol_kind"].as_str().unwrap().is_empty(),
+            "{expected}"
+        );
+        assert!(member["start_line"].as_u64().unwrap() >= 1, "{expected}");
+        assert!(member["end_line"].as_u64().unwrap() >= member["start_line"].as_u64().unwrap());
+        assert!(
+            !member["qualified_name"].as_str().unwrap().is_empty(),
+            "{expected}"
+        );
+    }
+    // Overloaded declarations are distinct members with distinct hashes.
+    let first = sandbox.member(&json, "method:Cache.size:0")["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let second = sandbox.member(&json, "method:Cache.size:1")["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(first, second);
+    assert!(first.starts_with("tnt2:member:"), "{first}");
+    // Non-source files never contribute members.
+    assert!(sandbox
+        .members(&json)
+        .iter()
+        .all(|member| member["path"] != "notes.txt"));
+
+    // Scoped member listing stays inside the scope.
+    let json = sandbox.json(&["read", "lib/inner.py", "--members", "--json"]);
+    let paths: BTreeSet<String> = sandbox
+        .members(&json)
+        .iter()
+        .map(|member| member["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(paths, BTreeSet::from(["lib/inner.py".to_string()]));
+    assert_eq!(
+        sandbox.member(&json, "function:plain.nested:0")["qualified_name"],
+        "plain.nested"
+    );
+    // A local constant inside a function body is not an addressable member.
+    assert!(sandbox
+        .members(&json)
+        .iter()
+        .all(|member| member["symbol"] != "constant:outer.LOCAL_LIMIT:0"));
+
+    // Text output lists members indented below their file, with the current hash.
+    let text = sandbox.ok(&["read", "Cache.java", "--members"]);
+    assert!(text.contains("size method:0 [method]"), "{text}");
+    assert!(text.contains("missing"), "{text}");
+
+    // Without `--members` nothing about the envelope changes except the version.
+    let json = sandbox.json(&["read", "--json"]);
+    assert!(json["members"].as_array().unwrap().is_empty());
+    assert!(json["parse_error"].is_null());
+}
+
+#[test]
+fn member_notes_are_per_declaration_and_guarded() {
+    let sandbox = Sandbox::new();
+    let source = fixture("tests/fixtures/java/Cache.java");
+    sandbox.write("Cache.java", &source);
+    sandbox.commit("init");
+
+    let json = sandbox.json(&["read", "Cache.java", "--members", "--json"]);
+    let first = sandbox.member(&json, "method:Cache.size:0")["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let second = sandbox.member(&json, "method:Cache.size:1")["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let out = sandbox.ok(&[
+        "member-set",
+        "Cache.java",
+        "method:Cache.size:0",
+        "--note",
+        "cached size",
+    ]);
+    assert!(out.contains("method:Cache.size:0"), "{out}");
+    sandbox.ok(&[
+        "member-set",
+        "Cache.java",
+        "method:Cache.size:1",
+        "--note",
+        "size with fallback",
+        "--expected-hash",
+        &second,
+    ]);
+
+    let json = sandbox.json(&["read", "Cache.java", "--members", "--json"]);
+    assert_eq!(
+        sandbox.member(&json, "method:Cache.size:0")["status"],
+        "fresh"
+    );
+    assert_eq!(
+        sandbox.member(&json, "method:Cache.size:0")["note"],
+        "cached size"
+    );
+    assert_eq!(
+        sandbox.member(&json, "method:Cache.size:1")["status"],
+        "fresh"
+    );
+    // Member notes are not file notes.
+    let file = sandbox.json(&["read", "Cache.java", "--json"]);
+    assert_eq!(sandbox.entry(&file, "Cache.java")["status"], "missing");
+
+    // Note text is validated exactly like a file note.
+    sandbox.fails(
+        &[
+            "member-set",
+            "Cache.java",
+            "method:Cache.size:0",
+            "--note",
+            "two\nlines",
+        ],
+        1,
+    );
+    let blank = sandbox.run_stdin(&["member-set", "Cache.java", "method:Cache.size:0"], "  \n");
+    assert_eq!(blank.status.code(), Some(1));
+
+    // Unknown symbol and unsupported file are invalid input.
+    let message = sandbox.fails(
+        &[
+            "member-set",
+            "Cache.java",
+            "method:Cache.missing:0",
+            "--note",
+            "x",
+        ],
+        1,
+    );
+    assert!(message.contains("has no member"), "{message}");
+    sandbox.write("notes.txt", "plain\n");
+    sandbox.commit("txt");
+    sandbox.fails(&["member-set", "notes.txt", "whatever", "--note", "x"], 1);
+    assert!(sandbox
+        .fails(
+            &[
+                "member-set",
+                "Cache.java",
+                "method:Cache.size:0",
+                "--note",
+                "x",
+                "--expected-hash",
+                "tnt2:member:deadbeef",
+            ],
+            1,
+        )
+        .contains("does not match"));
+
+    // Editing one declaration re-stales only that declaration.
+    sandbox.write(
+        "Cache.java",
+        &source.replace("return size;", "return size + 1;"),
+    );
+    sandbox.commit("edit size()");
+    let json = sandbox.json(&["read", "Cache.java", "--members", "--json"]);
+    let edited = sandbox.member(&json, "method:Cache.size:0");
+    assert_eq!(edited["status"], "stale");
+    assert_eq!(edited["note"], Value::Null);
+    assert_eq!(edited["previous"]["note"], "cached size");
+    assert_ne!(edited["hash"], first.as_str());
+    assert_eq!(
+        sandbox.member(&json, "method:Cache.size:1")["status"],
+        "fresh"
+    );
+    assert_eq!(sandbox.member(&json, "class:Cache:0")["status"], "missing");
+}
+
+#[test]
+fn set_ast_renotes_only_stale_members_that_already_have_a_note() {
+    let sandbox = Sandbox::new();
+    let source = fixture("tests/fixtures/java/Cache.java");
+    sandbox.write("Cache.java", &source);
+    sandbox.commit("init");
+    sandbox.annotate("Cache.java", "java cache fixture");
+    sandbox.ok(&[
+        "member-set",
+        "Cache.java",
+        "method:Cache.size:0",
+        "--note",
+        "cached size",
+    ]);
+
+    sandbox.write(
+        "Cache.java",
+        &source.replace("return size;", "return size + 1;"),
+    );
+    sandbox.commit("edit size()");
+    let json = sandbox.json(&["read", "Cache.java", "--members", "--json"]);
+    assert_eq!(
+        sandbox.member(&json, "method:Cache.size:0")["status"],
+        "stale"
+    );
+
+    let json = sandbox.json(&[
+        "set",
+        "Cache.java",
+        "--note",
+        "java cache fixture, revisited",
+        "--ast",
+        "--json",
+    ]);
+    let written = sandbox.members(&json);
+    assert_eq!(written.len(), 1, "{json}");
+    assert_eq!(written[0]["symbol"], "method:Cache.size:0");
+    assert_eq!(written[0]["note"], "cached size");
+    assert_eq!(written[0]["status"], "fresh");
+
+    let json = sandbox.json(&["read", "Cache.java", "--members", "--json"]);
+    assert_eq!(
+        sandbox.member(&json, "method:Cache.size:0")["status"],
+        "fresh"
+    );
+    assert_eq!(
+        sandbox.member(&json, "method:Cache.size:0")["note"],
+        "cached size"
+    );
+    // A member that was never annotated is never invented by `--ast`.
+    assert_eq!(
+        sandbox.member(&json, "method:Cache.size:1")["status"],
+        "missing"
+    );
+
+    // `--ast` needs exactly one file to re-note.
+    sandbox.fails(&["set", ".", "--note", "root", "--ast"], 1);
+}
+
+#[test]
+fn parse_errors_are_surfaced_without_hiding_recovered_members() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "Broken.java",
+        "package demo;\n\nclass Broken {\n    void ok() {}\n    void broken( { }\n}\n",
+    );
+    sandbox.commit("init");
+
+    let json = sandbox.json(&["read", "--members", "--json"]);
+    assert_eq!(json["parse_error"], true);
+    assert!(
+        !sandbox.members(&json).is_empty(),
+        "recovered members are still listed"
+    );
+}
+
+#[test]
+fn version_one_databases_migrate_additively() {
+    let sandbox = marker_repo();
+    sandbox.annotate("a.txt", "keep me across the migration");
+
+    // Rewind the database to the version-1 shape: file notes only, no member table.
+    let conn = sandbox.db_conn();
+    conn.execute_batch("DROP TABLE member_notes; PRAGMA user_version = 1;")
+        .unwrap();
+    drop(conn);
+
+    let json = sandbox.json(&["read", "a.txt", "--json"]);
+    assert_eq!(json["version"], 2);
+    assert_eq!(
+        sandbox.entry(&json, "a.txt")["note"],
+        "keep me across the migration"
+    );
+
+    let conn = sandbox.db_conn();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 3);
+    for table in [
+        "member_notes",
+        "snapshots",
+        "snapshot_entries",
+        "member_index_files",
+        "member_index",
+    ] {
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1, "{table} is created by the migration");
+    }
+    drop(conn);
+
+    // The migrated database accepts member notes straight away.
+    sandbox.write("Cache.java", &fixture("tests/fixtures/java/Cache.java"));
+    sandbox.commit("java");
+    sandbox.ok(&[
+        "member-set",
+        "Cache.java",
+        "class:Cache:0",
+        "--note",
+        "cache fixture class",
+    ]);
+    let json = sandbox.json(&["read", "Cache.java", "--members", "--json"]);
+    assert_eq!(sandbox.member(&json, "class:Cache:0")["status"], "fresh");
+}
+
+#[test]
+fn schema_two_databases_gain_only_the_derived_tables() {
+    let sandbox = marker_repo();
+    sandbox.annotate("a.txt", "keep me across the migration");
+
+    // Rewind the database to the version-2 shape: the note tables only, no derived state.
+    let conn = sandbox.db_conn();
+    conn.execute_batch(
+        "DROP TABLE member_index; DROP TABLE member_index_files; DROP TABLE snapshot_entries; \
+         DROP TABLE snapshots; PRAGMA user_version = 2;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let json = sandbox.json(&["read", "a.txt", "--json"]);
+    assert_eq!(json["version"], 2);
+    assert_eq!(
+        sandbox.entry(&json, "a.txt")["note"],
+        "keep me across the migration"
+    );
+
+    // The derived state tables exist again and the state command works on the migrated database.
+    let state = sandbox.json(&["state", "--json"]);
+    assert!(state["state"]["state_hash"].as_str().is_some(), "{state}");
+}
+
+#[test]
+fn state_hashes_the_tree_and_names_only_what_changed() {
+    let sandbox = Sandbox::new();
+    let java = fixture("tests/fixtures/java/Cache.java");
+    sandbox.write("a.txt", "alpha\n");
+    sandbox.write("d/f.txt", "f\n");
+    sandbox.write("Cache.java", &java);
+    sandbox.commit("init");
+
+    let first = sandbox.json(&["state", "--json"]);
+    let state_hash = first["state"]["state_hash"].as_str().unwrap().to_string();
+    assert!(state_hash.starts_with("tnt1:state:"), "{first}");
+    assert_eq!(first["version"], 2);
+    assert_eq!(first["command"], "state");
+    assert_eq!(first["state"]["known"], false);
+    assert_eq!(first["state"]["recorded"], true);
+    assert!(first["state"]["commit"].as_str().is_some(), "{first}");
+    assert!(first["state"]["compared_state"].is_null());
+    assert_eq!(first["state"]["changes"].as_array().unwrap().len(), 0);
+    // Only the Java fixture is source; nothing has parsed it yet.
+    assert_eq!(first["state"]["member_cache_hits"], 0);
+    assert_eq!(first["state"]["member_cache_misses"], 1);
+
+    // Re-observing the identical tree is a cache hit: nothing is re-recorded.
+    let again = sandbox.json(&["state", "--json"]);
+    assert_eq!(again["state"]["state_hash"], first["state"]["state_hash"]);
+    assert_eq!(again["state"]["known"], true);
+    assert_eq!(again["state"]["recorded"], false);
+
+    // Parsing a file once is enough for every later state report.
+    sandbox.json(&["read", "Cache.java", "--members", "--json"]);
+    let cached = sandbox.json(&["state", "--json"]);
+    assert_eq!(cached["state"]["member_cache_hits"], 1);
+    assert_eq!(cached["state"]["member_cache_misses"], 0);
+
+    // The state hash names content, not history: a commit that changes no bytes leaves it alone.
+    sandbox.git(&["commit", "-q", "--allow-empty", "-m", "empty"]);
+    assert_eq!(
+        sandbox.json(&["state", "--json"])["state"]["state_hash"],
+        state_hash
+    );
+
+    // One edited file and one rename, diffed against the first recorded state.
+    sandbox.write("a.txt", "alpha edited\n");
+    sandbox.write("d/g.txt", "f\n");
+    sandbox.remove("d/f.txt");
+    sandbox.commit("edit and rename");
+    let changed = sandbox.json(&["state", "--json", "--compare", &state_hash]);
+    let changes = changed["state"]["changes"].as_array().unwrap().clone();
+    let described: Vec<(String, String)> = changes
+        .iter()
+        .map(|change| {
+            (
+                change["path"].as_str().unwrap().to_string(),
+                change["change"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        described,
+        vec![
+            ("a.txt".to_string(), "modified".to_string()),
+            ("d/f.txt".to_string(), "removed".to_string()),
+            ("d/g.txt".to_string(), "added".to_string()),
+        ],
+        "{changed}"
+    );
+    // The untouched source file is absent: only real changes are named.
+    assert!(
+        changes.iter().all(|change| change["path"] != "Cache.java"),
+        "{changed}"
+    );
+    assert_eq!(changed["state"]["known"], false);
+
+    let text = sandbox.ok(&["state"]);
+    assert!(text.starts_with("state "), "{text}");
+    assert!(
+        text.contains("member cache 1/1 source file(s) parsed"),
+        "{text}"
+    );
+    assert!(text.contains("a.txt [file] modified"), "{text}");
+
+    // Reverting the working tree reproduces the exact original state hash — the hash is a pure
+    // function of the paths, kinds and content, so a settled state can be recognised later.
+    sandbox.write("a.txt", "alpha\n");
+    sandbox.write("d/f.txt", "f\n");
+    sandbox.remove("d/g.txt");
+    sandbox.commit("revert");
+    let reverted = sandbox.json(&["state", "--json"]);
+    assert_eq!(reverted["state"]["state_hash"], state_hash);
+    assert_eq!(reverted["state"]["known"], true);
+    assert_eq!(reverted["state"]["recorded"], false);
+
+    // Comparing against a state this database never recorded is invalid input.
+    let message = sandbox.fails(&["state", "--compare", "tnt1:state:00"], 1);
+    assert!(message.contains("has never been recorded"), "{message}");
+}
+
+#[test]
+fn pending_members_lists_only_missing_and_stale_declarations() {
+    let sandbox = Sandbox::new();
+    let source = fixture("tests/fixtures/java/Cache.java");
+    sandbox.write("Cache.java", &source);
+    sandbox.write("notes.txt", "plain text is not source\n");
+    sandbox.commit("init");
+
+    // Without the flag nothing about `pending` changes: no members, no parse_error.
+    let plain = sandbox.json(&["pending", "--json"]);
+    assert!(plain["members"].as_array().unwrap().is_empty());
+    assert!(plain["parse_error"].is_null());
+
+    // With the flag the tree listing is identical, and every unannotated declaration appears.
+    let json = sandbox.json(&["pending", "--members", "--json"]);
+    assert_eq!(json["version"], 2);
+    assert_eq!(json["command"], "pending");
+    assert_eq!(json["parse_error"], false);
+    assert_eq!(sandbox.paths(&json), sandbox.paths(&plain));
+    assert!(sandbox
+        .members(&json)
+        .iter()
+        .all(|member| member["status"] == "missing"));
+    assert!(sandbox
+        .members(&json)
+        .iter()
+        .any(|member| member["symbol"] == "method:Cache.size:0"));
+
+    // One annotated declaration leaves the list without touching its siblings, and annotating the
+    // file itself does not annotate its declarations.
+    sandbox.ok(&[
+        "member-set",
+        "Cache.java",
+        "method:Cache.size:0",
+        "--note",
+        "cached size",
+    ]);
+    sandbox.annotate("Cache.java", "cache with two size overloads");
+    let json = sandbox.json(&["pending", "--members", "--json"]);
+    // The file note and one declaration are fresh; the other file and its declarations are not.
+    assert!(!sandbox.paths(&json).contains(&"Cache.java".to_string()));
+    assert!(sandbox.paths(&json).contains(&"notes.txt".to_string()));
+    assert!(!sandbox
+        .members(&json)
+        .iter()
+        .any(|member| member["symbol"] == "method:Cache.size:0"));
+    assert!(sandbox
+        .members(&json)
+        .iter()
+        .any(|member| member["symbol"] == "method:Cache.size:1"));
+
+    // Editing one declaration re-stales exactly that one and puts it back in the list.
+    sandbox.write(
+        "Cache.java",
+        &source.replace("return size;", "return this.size;"),
+    );
+    sandbox.commit("edit one method");
+    let json = sandbox.json(&["pending", "--members", "--json"]);
+    let stale = sandbox.member(&json, "method:Cache.size:0");
+    assert_eq!(stale["status"], "stale");
+    assert_eq!(stale["previous"]["note"], "cached size");
+    // The sibling was never annotated at all, so it stays `missing` — untouched by the edit.
+    assert_eq!(
+        sandbox.member(&json, "method:Cache.size:1")["status"],
+        "missing"
+    );
+
+    // Text output names each pending declaration; nothing fresh is printed.
+    let text = sandbox.ok(&["pending", "--members"]);
+    assert!(text.contains("size method:0 [method]"), "{text}");
+    assert!(!text.contains("fresh"), "{text}");
+}
+
+#[test]
+fn text_trees_group_pending_declarations_under_their_files() {
+    let sandbox = Sandbox::new();
+    sandbox.write("Cache.java", &fixture("tests/fixtures/java/Cache.java"));
+    sandbox.write(
+        "lib/service.py",
+        &fixture("tests/fixtures/python/service.py"),
+    );
+    sandbox.write("lib/deep/tool.py", "def tool():\n    return 1\n");
+    sandbox.commit("init");
+    // One directory and one leaf file are annotated; two files own unannotated declarations.
+    sandbox.annotate("lib", "library sources");
+    sandbox.annotate("lib/deep/tool.py", "tiny helper");
+
+    let text = sandbox.ok(&["pending", "--members"]);
+    let lines = text_lines(&text);
+    let position = |needle: &str| {
+        lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line for {needle}: {lines:?}"))
+    };
+
+    // The scope is the root, and every pending entry hangs from it with a branch connector.
+    assert!(lines[0].starts_with(". [dir]"), "{lines:?}");
+    assert!(!lines[0].starts_with(['│', '├', '└']), "{lines:?}");
+    assert!(
+        lines[1..].iter().all(|line| line.contains("── ")),
+        "{lines:?}"
+    );
+
+    // Declarations are drawn under the file they were parsed from: the Java file before its own
+    // methods, and both before the Python file that comes later in path order.
+    // Depth is the display column the branch connector lands in, over four-column levels.
+    let depth = |needle: &str| {
+        let line = &lines[position(needle)];
+        let column = line
+            .find('─')
+            .unwrap_or_else(|| panic!("no branch connector for {needle}"));
+        line[..column].chars().count() / 4 + 1
+    };
+    assert_eq!(depth("Cache.java [file]"), 1, "{lines:?}");
+    assert_eq!(depth("size method:0"), 2, "{lines:?}");
+    assert_eq!(depth("lib/service.py [file]"), 1, "{lines:?}");
+    assert_eq!(depth("run function:0"), 2, "{lines:?}");
+    assert!(
+        position("size method:0") < position("lib/service.py [file]"),
+        "{lines:?}"
+    );
+
+    // A fresh file that owns a pending declaration is drawn as context only: no hash, no status.
+    let context = position("(lib/deep/tool.py) [context]");
+    let line = &lines[context];
+    assert!(!line.contains("missing"), "{lines:?}");
+    assert!(!line.contains("fresh"), "{lines:?}");
+    assert!(context < position("tool function:0"), "{lines:?}");
+    assert_eq!(depth("lib/deep [dir]"), 1, "{lines:?}");
+    assert_eq!(depth("tool function:0"), 3, "{lines:?}");
+    // Neither the annotated directory nor the fresh file is ever listed as pending work.
+    let pending = sandbox.paths(&sandbox.json(&["pending", "--json"]));
+    assert!(
+        !pending.contains(&"lib".to_string()) && !pending.contains(&"lib/deep/tool.py".to_string()),
+        "{pending:?}"
+    );
+
+    // The text tree is a rendering only: the JSON view and its filtering are unchanged.
+    let json = sandbox.json(&["pending", "--members", "--json"]);
+    assert_eq!(sandbox.entry(&json, "Cache.java")["status"], "missing");
+    assert!(
+        !sandbox
+            .paths(&json)
+            .contains(&"lib/deep/tool.py".to_string()),
+        "a fresh file is never listed as pending"
+    );
+    assert_eq!(
+        sandbox.member(&json, "function:tool:0")["path"],
+        "lib/deep/tool.py"
+    );
 }
