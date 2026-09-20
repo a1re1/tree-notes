@@ -73,10 +73,40 @@ impl Store {
             .map_err(|e| CmdError::env(format!("cannot open database {}: {e}", path.display())))?;
         conn.busy_timeout(Duration::from_secs(10))
             .map_err(|e| CmdError::env(format!("cannot set the database busy timeout: {e}")))?;
-        let mode: String = conn
-            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
-            .map_err(|e| CmdError::env(format!("cannot enable WAL journalling: {e}")))?;
-        let _ = mode;
+        // Switching a fresh database into WAL mode briefly needs an exclusive lock that
+        // SQLite's busy handler does not cover, so several processes opening the same
+        // not-yet-initialized database at once can collide here. Retry while the
+        // competing process holds the lock; every other open failure is still fatal.
+        let mut wal_error = None;
+        for _ in 0..500 {
+            match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(_mode) => {
+                    wal_error = None;
+                    break;
+                }
+                Err(error) => match &error {
+                    rusqlite::Error::SqliteFailure(code, _)
+                        if code.code == rusqlite::ErrorCode::DatabaseBusy
+                            || code.code == rusqlite::ErrorCode::DatabaseLocked =>
+                    {
+                        wal_error = Some(error);
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    _ => {
+                        return Err(CmdError::env(format!(
+                            "cannot enable WAL journalling: {error}"
+                        )))
+                    }
+                },
+            }
+        }
+        if let Some(error) = wal_error {
+            return Err(CmdError::env(format!(
+                "cannot enable WAL journalling: {error}"
+            )));
+        }
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| CmdError::env(format!("cannot set synchronous mode: {e}")))?;
         let mut store = Store { conn };
