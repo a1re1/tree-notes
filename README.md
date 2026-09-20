@@ -273,3 +273,10 @@ $ cargo test --all-targets --all-features
 
 Integration tests in `tests/cli.rs` build real temporary Git repositories (including linked
 worktrees and submodules) and temporary databases; they never touch `~/.tree-notes`.
+
+## Planned: AST/member annotations
+
+[`docs/ast-annotations-plan.md`](docs/ast-annotations-plan.md) is a research/design document for
+annotating *methods and other declarations inside a file* (Java, Rust, TypeScript/JavaScript and
+Python first, more languages later). It is not implemented: today's behaviour, the `tnt1` hash
+scheme and the `version: 1` JSON envelope are unchanged.
