@@ -402,6 +402,7 @@ fn status_is_missing_then_fresh_then_stale_then_fresh_again() {
 
     let pending_text = sandbox.ok(&["pending", "a.txt"]);
     assert!(pending_text.contains("stale"), "{pending_text}");
+    assert!(pending_text.contains("previous (stale"), "{pending_text}");
     assert!(
         pending_text.contains("previous (stale, not current)"),
         "{pending_text}"
@@ -805,8 +806,20 @@ fn read_scopes_depth_and_subdirectory_invocation() {
     let text = sandbox.ok(&["read", "lib"]);
     let lines = text_lines(&text);
     assert!(lines[0].starts_with("lib [dir]"), "{lines:?}");
-    assert!(lines[1].starts_with("  lib/b.txt [file]"), "{lines:?}");
-    assert!(lines.iter().any(|line| line.contains("\"beta note\"")));
+    assert!(
+        !lines[0].starts_with([' ', '│', '├', '└']),
+        "the scope is the tree root and is never indented: {lines:?}"
+    );
+    // Every other line is drawn with a branch connector, so nesting is always visible.
+    assert!(
+        lines[1..].iter().all(|line| line.contains("── ")),
+        "{lines:?}"
+    );
+    assert!(lines[1].starts_with("├── lib/b.txt [file]"), "{lines:?}");
+    assert!(
+        lines.iter().any(|line| line.contains("\"beta note\"")),
+        "{lines:?}"
+    );
 
     // The absolute path of the repository root is the root scope.
     let json = sandbox.json(&["read", sandbox.repo.to_str().unwrap(), "--json"]);
@@ -2052,4 +2065,84 @@ fn pending_members_lists_only_missing_and_stale_declarations() {
     let text = sandbox.ok(&["pending", "--members"]);
     assert!(text.contains("size method:0 [method]"), "{text}");
     assert!(!text.contains("fresh"), "{text}");
+}
+
+#[test]
+fn text_trees_group_pending_declarations_under_their_files() {
+    let sandbox = Sandbox::new();
+    sandbox.write("Cache.java", &fixture("tests/fixtures/java/Cache.java"));
+    sandbox.write(
+        "lib/service.py",
+        &fixture("tests/fixtures/python/service.py"),
+    );
+    sandbox.write("lib/deep/tool.py", "def tool():\n    return 1\n");
+    sandbox.commit("init");
+    // One directory and one leaf file are annotated; two files own unannotated declarations.
+    sandbox.annotate("lib", "library sources");
+    sandbox.annotate("lib/deep/tool.py", "tiny helper");
+
+    let text = sandbox.ok(&["pending", "--members"]);
+    let lines = text_lines(&text);
+    let position = |needle: &str| {
+        lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line for {needle}: {lines:?}"))
+    };
+
+    // The scope is the root, and every pending entry hangs from it with a branch connector.
+    assert!(lines[0].starts_with(". [dir]"), "{lines:?}");
+    assert!(!lines[0].starts_with(['│', '├', '└']), "{lines:?}");
+    assert!(
+        lines[1..].iter().all(|line| line.contains("── ")),
+        "{lines:?}"
+    );
+
+    // Declarations are drawn under the file they were parsed from: the Java file before its own
+    // methods, and both before the Python file that comes later in path order.
+    // Depth is the display column the branch connector lands in, over four-column levels.
+    let depth = |needle: &str| {
+        let line = &lines[position(needle)];
+        let column = line
+            .find('─')
+            .unwrap_or_else(|| panic!("no branch connector for {needle}"));
+        line[..column].chars().count() / 4 + 1
+    };
+    assert_eq!(depth("Cache.java [file]"), 1, "{lines:?}");
+    assert_eq!(depth("size method:0"), 2, "{lines:?}");
+    assert_eq!(depth("lib/service.py [file]"), 1, "{lines:?}");
+    assert_eq!(depth("run function:0"), 2, "{lines:?}");
+    assert!(
+        position("size method:0") < position("lib/service.py [file]"),
+        "{lines:?}"
+    );
+
+    // A fresh file that owns a pending declaration is drawn as context only: no hash, no status.
+    let context = position("(lib/deep/tool.py) [context]");
+    let line = &lines[context];
+    assert!(!line.contains("missing"), "{lines:?}");
+    assert!(!line.contains("fresh"), "{lines:?}");
+    assert!(context < position("tool function:0"), "{lines:?}");
+    assert_eq!(depth("lib/deep [dir]"), 1, "{lines:?}");
+    assert_eq!(depth("tool function:0"), 3, "{lines:?}");
+    // Neither the annotated directory nor the fresh file is ever listed as pending work.
+    let pending = sandbox.paths(&sandbox.json(&["pending", "--json"]));
+    assert!(
+        !pending.contains(&"lib".to_string()) && !pending.contains(&"lib/deep/tool.py".to_string()),
+        "{pending:?}"
+    );
+
+    // The text tree is a rendering only: the JSON view and its filtering are unchanged.
+    let json = sandbox.json(&["pending", "--members", "--json"]);
+    assert_eq!(sandbox.entry(&json, "Cache.java")["status"], "missing");
+    assert!(
+        !sandbox
+            .paths(&json)
+            .contains(&"lib/deep/tool.py".to_string()),
+        "a fresh file is never listed as pending"
+    );
+    assert_eq!(
+        sandbox.member(&json, "function:tool:0")["path"],
+        "lib/deep/tool.py"
+    );
 }

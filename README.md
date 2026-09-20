@@ -48,26 +48,28 @@ Global options:
 Commands:
 
 * `pending [PATH]` — list entries under `PATH` (default: the whole repository) that are `missing`
-  or `stale`. The current hash is always shown. Children come before their parents so an agent can
-  summarize files first and directories afterwards. Stale entries also show the previous note,
-  always labelled as *not current*, together with the hash that note belongs to. Exits 0 even when
-  the list is empty.
+  or `stale`. The current hash and note status are always shown. Stale entries also show the previous
+  note, always labelled as *not current*, together with the hash that note belongs to. Exits 0 even
+  when the list is empty — nothing is printed then.
 * `pending [PATH] --members` — additionally list the `missing` or `stale` declarations inside the
-  scoped source files (the same members `read --members` shows, minus the fresh ones). Entries and
-  members are one list: every entry, then every pending declaration in shallowest-file-first, then
-  file, then document order. `parse_error` is reported for the scope exactly as in `read --members`.
-  This is how an agent finds unannotated methods: a declaration is never mixed into `entries`, and
-  without a pending declaration the members array stays empty.
+  scoped source files (the same members `read --members` shows, minus the fresh ones). In text output
+  each pending declaration is drawn as a child of the file it was parsed from, in document order.
+  `parse_error` is reported for the scope exactly as in `read --members`. This is how an agent finds
+  unannotated methods: a declaration is never mixed into `entries`, and without a pending declaration
+  the members array stays empty.
 * `read [PATH] [--depth N]` — show the tree, or exactly one file, or one directory subtree, with
-  freshness for every entry. `--depth 0` shows only the scope itself. Output is an indented text
-  map by default, or a versioned JSON envelope with `--json`. Root (`.`) and unannotated entries
-  are always included so coverage gaps stay visible.
+  freshness for every entry. `--depth 0` shows only the scope itself. Text output is one nested
+  ASCII tree — a parent above its children, `│` for levels that continue, `├──` for a child with
+  siblings after it and `└──` for the last one — or a versioned JSON envelope with `--json`. Root
+  (`.`) and unannotated entries are always included so coverage gaps stay visible.
 * `set PATH --note TEXT [--expected-hash HASH]` — annotate the *current* version of `PATH`. With no
   `--note`, the one-line note is read from stdin (`printf 'summary\n' | treenotes set src/lib.rs`),
   which avoids shell-quoting friction. `--expected-hash` refuses the write unless the current hash
   still matches, guarding against annotating content that changed while the agent was reading it.
 * `read PATH --members` — additionally list the annotatable declarations *inside* the scoped source
-  files (Java, Rust, TypeScript/TSX, JavaScript and Python). Each member carries its symbol key
+  files (Java, Rust, TypeScript/TSX, JavaScript and Python). In text output each declaration is
+  drawn one level below the file it was parsed from, so the nesting repeats what the AST already
+  knows and no parent is ever guessed from a name. Each member carries its symbol key
   (`<kind>:<qualified name>:<ordinal>`), its declared and qualified names, its line span, its own
   `tnt2` hash and its own note status. Scoped non-source files (symlinks, submodules, directories,
   unsupported extensions) contribute nothing. When a grammar has to recover from a syntax error the
@@ -281,7 +283,9 @@ Field notes:
 * `scope` appears for `pending` and `read` (`path` is `"."` for the whole repository; `kind` is
   `file`/`dir`/`symlink`/`submodule`; `depth` is the requested limit or `null`).
 * `entries` is a deterministic array: `read` orders entries by path; `pending` orders descendants
-  before ancestors with the scope last.
+  before ancestors with the scope last. The text tree is a rendering of the same data, not a second
+  model: `--json` output is unchanged by it, and `members` is always ordered by path, then document
+  order.
 * `set --json` adds `message`; `import --json` adds `imported` (number of records written) and
   `message`, with one `entries` item per written record.
 * `members` is always present and ordered by path, then start line. `read --members` fills it for the
@@ -374,6 +378,38 @@ $ cargo test --all-targets --all-features
 
 Integration tests in `tests/cli.rs` build real temporary Git repositories (including linked
 worktrees and submodules) and temporary databases; they never touch `~/.tree-notes`.
+
+## Text trees
+
+`pending` and `read` print one nested ASCII tree per invocation. The scope is the root line, every
+listed entry hangs below its parent directory, and every requested declaration hangs below the file
+it was parsed from:
+
+```text
+. [dir] tnt1:dir:ccf4f86ea580 missing
+├── Cache.java [file] tnt1:file:07a2f172571b missing
+│   ├── Cache class:0 [class] tnt2:member:125515eb9cc7 missing
+│   └── size method:0 [method] tnt2:member:ec4e50e1bd59 missing
+└── lib/service.py [file] tnt1:file:0a5524ee00c6 missing
+    └── run function:0 [function] tnt2:member:7487ed841c20 missing
+```
+
+Two deliberate choices keep the tree honest:
+
+* **Parents first.** The text tree is drawn parent first, so a file always sits above the
+  declarations it owns and a directory above its files; the JSON `entries` array keeps its own
+  documented order (children first for `pending`), because it is a separate contract.
+* **Context lines are never pending work.** A file that was never annotated can still hold
+  unannotated declarations, and a directory on the way to such a file may already be annotated. Both
+  are drawn as `(path) [context]` with no hash and no status, so nothing that needs no attention is
+  presented as if it did, while the declarations below still say exactly where they live.
+
+Stale lines carry their previous note beneath them, always labelled *not current*:
+
+```text
+├── a.txt [file] tnt1:file:fcd2653d2d11 stale
+│   previous (stale, not current): tnt1:file:62e99d22bc3a "first version"
+```
 
 ## AST/member annotations
 

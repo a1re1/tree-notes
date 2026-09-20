@@ -10,10 +10,11 @@ use serde::Deserialize;
 
 use crate::ast;
 use crate::output::{
-    compare_children_first, depth_key, ComparedStateJson, EntryJson, EntryView, Envelope,
-    MemberJson, MemberView, RepoJson, ScopeJson, StateChangeJson, StateJson, Status,
+    build_tree, compare_children_first, depth_key, ComparedStateJson, EntryJson, EntryView,
+    Envelope, MemberJson, MemberView, RepoJson, ScopeJson, StateChangeJson, StateJson, Status,
+    TreeChild,
 };
-use crate::repo::{in_scope, state_hash, Entry, Kind, Repo};
+use crate::repo::{in_scope, parent_path, state_hash, Entry, Kind, Repo};
 use crate::store::{
     default_db_path, CachedMember, MemberVersion, NewMemberNote, NewNote, NoteVersion, Store,
 };
@@ -253,20 +254,12 @@ fn cmd_pending(ctx: &mut Ctx, args: PendingArgs) -> Result<(), CmdError> {
         return envelope.print();
     }
 
-    let mut lines = Vec::new();
-    for view in &views {
-        lines.push(view.text_line(&scope.path));
-        if let Some(previous) = view.text_previous_line(&scope.path) {
-            lines.push(previous);
-        }
-    }
-    for member in &members {
-        lines.push(member.text_line(&scope.path));
-        if let Some(previous) = member.text_previous_line(&scope.path) {
-            lines.push(previous);
-        }
-    }
-    crate::output::print_lines(&lines)
+    // The text tree is drawn parent first so a file always sits above its declarations and a
+    // directory above its files; the JSON `entries` array keeps its documented children-first
+    // order, so `--json` output is unchanged by this rendering.
+    let mut by_path = views.clone();
+    by_path.sort_by(|a, b| a.path.cmp(&b.path));
+    crate::output::print_lines(&tree_lines(&scope, &by_path, &members)?)
 }
 
 fn cmd_read(ctx: &mut Ctx, args: ReadArgs) -> Result<(), CmdError> {
@@ -308,17 +301,7 @@ fn cmd_read(ctx: &mut Ctx, args: ReadArgs) -> Result<(), CmdError> {
         return envelope.print();
     }
 
-    let mut lines: Vec<String> = views
-        .iter()
-        .map(|view| view.text_line(&scope.path))
-        .collect();
-    for member in &members {
-        lines.push(member.text_line(&scope.path));
-        if let Some(previous) = member.text_previous_line(&scope.path) {
-            lines.push(previous);
-        }
-    }
-    crate::output::print_lines(&lines)
+    crate::output::print_lines(&tree_lines(&scope, &views, &members)?)
 }
 
 fn cmd_set(ctx: &mut Ctx, args: SetArgs) -> Result<(), CmdError> {
@@ -903,6 +886,112 @@ fn cmd_import(ctx: &mut Ctx, args: ImportArgs) -> Result<(), CmdError> {
     }
 
     crate::output::print_lines(&[format!("imported {count} notes")])
+}
+
+/// One nested ASCII tree of a listing: every entry with the declarations that belong to it.
+///
+/// Both slices must be in path order, with each file's declarations grouped and kept in document
+/// order. Anything that only *locates* the rest — an ancestor directory, or a file that holds
+/// listed declarations but is not itself unfinished — is drawn as `(path) [context]` without a
+/// hash or a status, so a fresh file is never presented as pending work.
+fn tree_lines(
+    scope: &Scope,
+    views: &[EntryView],
+    members: &[MemberView],
+) -> Result<Vec<String>, CmdError> {
+    let mut listed: BTreeMap<&str, &EntryView> = BTreeMap::new();
+    for view in views {
+        listed.insert(view.path.as_str(), view);
+    }
+    let mut grouped: BTreeMap<&str, Vec<&MemberView>> = BTreeMap::new();
+    for member in members {
+        grouped
+            .entry(member.path.as_str())
+            .or_default()
+            .push(member);
+    }
+    let mut paths: BTreeSet<&str> = listed.keys().copied().collect();
+    paths.extend(grouped.keys().copied());
+
+    let mut children: Vec<(Option<String>, TreeChild)> = Vec::new();
+    // A label per path that has already been drawn, so a child can name the node it hangs from.
+    let mut labels: BTreeMap<&str, &str> = BTreeMap::new();
+    match listed.get(scope.path.as_str()) {
+        Some(view) => {
+            children.push((None, TreeChild::Entry((*view).clone())));
+            if let Some(previous) = view.previous_body() {
+                children.push((Some(view.path.clone()), TreeChild::Detail(previous)));
+            }
+        }
+        None => children.push((None, TreeChild::Context(scope.path.clone()))),
+    }
+    labels.insert(scope.path.as_str(), scope.path.as_str());
+
+    for path in paths {
+        if path != scope.path.as_str() {
+            match listed.get(path) {
+                Some(view) => {
+                    children.push((
+                        nearest_label(&labels, path),
+                        TreeChild::Entry((*view).clone()),
+                    ));
+                    labels.insert(path, path);
+                    if let Some(previous) = view.previous_body() {
+                        children.push((Some(path.to_string()), TreeChild::Detail(previous)));
+                    }
+                }
+                None => {
+                    // A declaration whose file is not itself listed: draw the file and every
+                    // ancestor that is missing as context, top down.
+                    let mut chain: Vec<&str> = vec![path];
+                    let mut parent = parent_path(path);
+                    while !labels.contains_key(parent) {
+                        chain.push(parent);
+                        parent = parent_path(parent);
+                    }
+                    for context in chain.iter().rev() {
+                        children.push((
+                            nearest_label(&labels, context),
+                            TreeChild::Context((*context).to_string()),
+                        ));
+                        labels.insert(context, context);
+                    }
+                }
+            }
+        }
+        if let Some(group) = grouped.get(path) {
+            let owner = labels.get(path).copied().unwrap_or(scope.path.as_str());
+            for member in group {
+                children.push((
+                    Some(owner.to_string()),
+                    TreeChild::Member((*member).clone()),
+                ));
+                if let Some(previous) = member.previous_body() {
+                    children.push((Some(member.symbol.clone()), TreeChild::Detail(previous)));
+                }
+            }
+        }
+    }
+    // A scope that needs nothing drawn is not a tree: printing only the scope as context would
+    // turn an empty `pending` into a line that looks like an entry.
+    if children.len() == 1 && matches!(children[0].1, TreeChild::Context(_)) {
+        return Ok(Vec::new());
+    }
+    build_tree(&children)
+}
+
+/// Label of the closest already drawn ancestor of `path`.
+fn nearest_label<'a>(labels: &BTreeMap<&'a str, &'a str>, path: &str) -> Option<String> {
+    let mut parent = parent_path(path);
+    loop {
+        if let Some(label) = labels.get(parent) {
+            return Some((*label).to_string());
+        }
+        if parent == "." {
+            return None;
+        }
+        parent = parent_path(parent);
+    }
 }
 
 /// Current entries within a path scope, paired with their stored note versions.

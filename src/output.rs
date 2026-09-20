@@ -147,35 +147,59 @@ impl MemberView {
         hex_of(&self.hash).chars().take(12).collect()
     }
 
-    /// Text line for one member, indented one level below its file.
-    pub fn text_line(&self, scope: &str) -> String {
-        let indent = "  ".repeat(depth_within(scope, &self.path) + 1);
-        let mut line = format!(
-            "{indent}{} {}:{} [{}] {} {}",
-            self.name,
-            self.symbol_kind,
-            self.symbol
-                .rsplit_once(':')
-                .map(|(_, ordinal)| ordinal)
-                .unwrap_or("0"),
+    /// Ordinal of this symbol, the last `:`-separated component of the symbol key.
+    pub fn ordinal(&self) -> &str {
+        self.symbol
+            .rsplit_once(':')
+            .map(|(_, ordinal)| ordinal)
+            .unwrap_or("0")
+    }
+
+    /// Label of one declaration, the form used wherever a label is needed.
+    pub fn label(&self) -> String {
+        format!("{} {}:{}", self.name, self.symbol_kind, self.ordinal())
+    }
+
+    /// Body of one declaration: label, member kind, hash and status, then the note when fresh.
+    pub fn body(&self) -> String {
+        let mut body = format!(
+            "{} [{}] {} {}",
+            self.label(),
             self.symbol_kind,
             self.short_hash(),
             self.status.as_str()
         );
         if let Some(note) = &self.note {
-            line.push_str(&format!(" {}", quote(note)));
+            body.push_str(&format!(" {}", quote(note)));
         }
-        line
+        body
+    }
+
+    /// Previous-note body of a stale declaration, labelled as not current.
+    pub fn previous_body(&self) -> Option<String> {
+        let previous = self.previous.as_ref()?;
+        Some(format!(
+            "previous (stale, not current): {} {}",
+            previous.hash,
+            quote(&previous.note)
+        ))
+    }
+
+    /// Text line for one member, indented one level below its file.
+    pub fn text_line(&self, scope: &str) -> String {
+        format!(
+            "{}{}",
+            "  ".repeat(depth_within(scope, &self.path) + 1),
+            self.body()
+        )
     }
 
     /// Text line naming the previous note of a stale member, labelled as not current.
     pub fn text_previous_line(&self, scope: &str) -> Option<String> {
-        let previous = self.previous.as_ref()?;
-        let indent = "  ".repeat(depth_within(scope, &self.path) + 2);
         Some(format!(
-            "{indent}previous (stale, not current): {} {}",
-            previous.hash,
-            quote(&previous.note)
+            "{}{}",
+            "  ".repeat(depth_within(scope, &self.path) + 2),
+            self.previous_body()?
         ))
     }
 }
@@ -316,30 +340,51 @@ impl EntryView {
         hex.chars().take(12).collect()
     }
 
-    /// Text line for one entry, indented relative to a scope.
-    pub fn text_line(&self, scope: &str) -> String {
-        let indent = "  ".repeat(depth_within(scope, &self.path));
-        let mut line = format!(
-            "{indent}{} [{}] {} {}",
+    /// Body of one entry: path, kind, hash, status, then the note when fresh.
+    fn body(&self) -> String {
+        let mut body = format!(
+            "{} [{}] {} {}",
             self.path,
             self.kind.as_str(),
             self.short_hash(),
             self.status.as_str()
         );
         if let Some(note) = &self.note {
-            line.push_str(&format!(" {}", quote(note)));
+            body.push_str(&format!(" {}", quote(note)));
         }
-        line
+        body
+    }
+
+    /// Body of one entry inside the text tree.
+    pub fn tree_body(&self) -> String {
+        self.body()
+    }
+
+    /// Text line for one entry, indented relative to a scope, for listings that are not a tree.
+    pub fn text_line(&self, scope: &str) -> String {
+        format!(
+            "{}{}",
+            "    ".repeat(depth_within(scope, &self.path)),
+            self.body()
+        )
+    }
+
+    /// Previous-note body of a stale entry, labelled as not current.
+    pub fn previous_body(&self) -> Option<String> {
+        let previous = self.previous.as_ref()?;
+        Some(format!(
+            "previous (stale, not current): {} {}",
+            previous.hash,
+            quote(&previous.note)
+        ))
     }
 
     /// Text line naming the previous note of a stale entry, labelled as not current.
     pub fn text_previous_line(&self, scope: &str) -> Option<String> {
-        let previous = self.previous.as_ref()?;
-        let indent = "  ".repeat(depth_within(scope, &self.path) + 1);
         Some(format!(
-            "{indent}previous (stale, not current): {} {}",
-            previous.hash,
-            quote(&previous.note)
+            "{}{}",
+            "    ".repeat(depth_within(scope, &self.path) + 1),
+            self.previous_body()?
         ))
     }
 }
@@ -347,6 +392,107 @@ impl EntryView {
 /// Sort key: entry depth relative to the scope.
 pub fn depth_key(scope: &str, path: &str) -> usize {
     depth_within(scope, path)
+}
+
+/// One node of the text tree, in the order it should be drawn.
+#[derive(Clone, Debug)]
+pub enum TreeChild {
+    /// A file or directory entry, as it appears in `entries`, with its hash and note status.
+    Entry(EntryView),
+    /// A path that is *not* part of the listing and is drawn only to locate something below it
+    /// (an ancestor directory, or a file that holds a listed declaration). It carries no hash and
+    /// no status, because nothing about it is unfinished.
+    Context(String),
+    /// A declaration inside the file named by the node it hangs from.
+    Member(MemberView),
+    /// Extra information about the node it hangs from, such as a stale previous note.
+    Detail(String),
+}
+
+/// Render the requested entries and declarations as one nested ASCII tree.
+///
+/// Each element names the *closest requested ancestor*, or `None` when nothing in the listing
+/// contains it (a `pending` directory whose parent directory is already annotated, say). The first
+/// element must have no ancestor: it is the tree root the rest hangs from. An element appears
+/// directly below its ancestor; a member is always placed below the file it was parsed from, which
+/// is the preceding file entry, so no parentage is ever inferred from a declaration's name.
+///
+/// A file that is not itself listed is still printed when it holds a listed declaration: it
+/// appears in parentheses as `(path) [context]`, never with a note status, because nothing about
+/// that file is unfinished — it is printed only to say where the declarations below it live.
+pub fn build_tree(children: &[(Option<String>, TreeChild)]) -> Result<Vec<String>, CmdError> {
+    if children.is_empty() {
+        return Ok(Vec::new());
+    }
+    if children[0].0.is_some() {
+        return Err(CmdError::usage("tree listing is missing its root entry"));
+    }
+    let total = children.len();
+    let mut lines = vec![node_body(&children[0].1)];
+    // Per level: the label of the ancestor at that depth, and whether the node that opened the
+    // level was the last child of its own parent (so the level draws blanks instead of pipes).
+    let mut labels: Vec<String> = vec![node_label(&children[0].1)];
+    let mut closes: Vec<bool> = vec![false];
+    for index in 1..total {
+        let parent = children[index]
+            .0
+            .as_deref()
+            .ok_or_else(|| CmdError::usage("tree listing has a second root entry"))?;
+        let level = labels
+            .iter()
+            .rposition(|label| label == parent)
+            .ok_or_else(|| {
+                CmdError::usage(format!("tree listing names unknown ancestor {parent}"))
+            })?;
+        // The node is one level below its parent, so the levels strictly above it draw a pipe when
+        // the ancestor that opened them is not the last child of its own parent, and blanks when it
+        // is — the same convention as `tree` and `git log --graph`.
+        let depth = level + 1;
+        let ancestors: String = (1..depth)
+            .map(|above| {
+                if closes.get(above).copied().unwrap_or(false) {
+                    "    "
+                } else {
+                    "│   "
+                }
+            })
+            .collect();
+        let last = children[index + 1..]
+            .iter()
+            .all(|(next, _)| next.as_deref() != Some(parent));
+        let connector = if last { "└── " } else { "├── " };
+        lines.push(format!(
+            "{ancestors}{connector}{}",
+            node_body(&children[index].1)
+        ));
+        // The node that was just drawn owns the next level: its own "last child" flag decides
+        // whether the levels underneath it draw a pipe or a blank.
+        labels.truncate(level + 1);
+        labels.push(node_label(&children[index].1));
+        closes.truncate(level + 1);
+        closes.push(last);
+    }
+    Ok(lines)
+}
+
+/// Body of one node of the tree, without any branch decoration.
+fn node_body(child: &TreeChild) -> String {
+    match child {
+        TreeChild::Entry(view) => view.tree_body(),
+        TreeChild::Context(path) => format!("({path}) [context]"),
+        TreeChild::Member(member) => member.body(),
+        TreeChild::Detail(text) => text.clone(),
+    }
+}
+
+/// The label other nodes name as their ancestor. A detail line is never an ancestor.
+fn node_label(child: &TreeChild) -> String {
+    match child {
+        TreeChild::Entry(view) => view.path.clone(),
+        TreeChild::Context(path) => path.clone(),
+        TreeChild::Member(member) => member.symbol.clone(),
+        TreeChild::Detail(_) => String::new(),
+    }
 }
 
 /// Ordering used by `pending`: descendants before their ancestors, scope last, name order
