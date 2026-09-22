@@ -910,8 +910,17 @@ fn tree_lines(
             .or_default()
             .push(member);
     }
-    let mut paths: BTreeSet<&str> = listed.keys().copied().collect();
+    // The listing must be drawn in tree order: an ancestor above every descendant, siblings in
+    // name order. A plain byte sort of the paths is not that order — `/` sorts after `.`, so a
+    // sibling whose name extends an ancestor's (`src/cli/marketplaces.rs` beside the directory
+    // `src/cli/marketplaces`) would come *before* the directory and, being no descendant of it,
+    // push the directory's own children below a node `build_tree` has already popped off its
+    // level stack. Comparing component by component keeps shared prefixes together while every
+    // ancestor still precedes all of its descendants.
+    let mut paths: Vec<&str> = listed.keys().copied().collect();
     paths.extend(grouped.keys().copied());
+    paths.sort_by(|a, b| a.split('/').cmp(b.split('/')));
+    paths.dedup();
 
     let mut children: Vec<(Option<String>, TreeChild)> = Vec::new();
     // A label per path that has already been drawn, so a child can name the node it hangs from.

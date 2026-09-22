@@ -486,7 +486,7 @@ fn node_body(child: &TreeChild) -> String {
 }
 
 /// The label other nodes name as their ancestor. A detail line is never an ancestor.
-fn node_label(child: &TreeChild) -> String {
+pub fn node_label(child: &TreeChild) -> String {
     match child {
         TreeChild::Entry(view) => view.path.clone(),
         TreeChild::Context(path) => path.clone(),

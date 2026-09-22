@@ -2146,3 +2146,50 @@ fn text_trees_group_pending_declarations_under_their_files() {
         "lib/deep/tool.py"
     );
 }
+
+#[test]
+fn text_tree_keeps_a_directory_and_its_children_above_a_sibling_file_named_like_it() {
+    let sandbox = Sandbox::new();
+    sandbox.write("src/cli/marketplaces.rs", "export function a() {}\n");
+    sandbox.write("src/cli/marketplaces/top.ts", "export function b() {}\n");
+    sandbox.write("src/cli/other.rs", "export function c() {}\n");
+    sandbox.commit("layout");
+
+    // `src/cli/marketplaces.rs` shares a prefix with the directory `src/cli/marketplaces` but is
+    // not below it. Drawing the sibling first would leave the directory's own child hanging from
+    // an ancestor the renderer had already closed.
+    let read = text_lines(&sandbox.ok(&["read"]));
+    let at = |lines: &[String], needle: &str| {
+        lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} missing from {lines:?}"))
+    };
+    let indent = |line: &str| line.find("── ").expect("every non-root line is drawn");
+    let dir = at(&read, "src/cli/marketplaces [dir]");
+    let child = at(&read, "src/cli/marketplaces/top.ts [file]");
+    let sibling = at(&read, "src/cli/marketplaces.rs [file]");
+    assert!(dir < child && child < sibling, "{read:?}");
+    assert!(
+        indent(&read[child]) > indent(&read[dir]),
+        "the file hangs one level below its directory: {read:?}"
+    );
+    assert_eq!(
+        indent(&read[sibling]),
+        indent(&read[dir]),
+        "the like-named file is a sibling of the directory: {read:?}"
+    );
+
+    // `pending` feeds the same renderer a children-first listing, and draws the same tree.
+    let pending = text_lines(&sandbox.ok(&["pending"]));
+    assert!(
+        at(&pending, "src/cli/marketplaces [dir]")
+            < at(&pending, "src/cli/marketplaces/top.ts [file]"),
+        "{pending:?}"
+    );
+    assert!(
+        at(&pending, "src/cli/marketplaces/top.ts [file]")
+            < at(&pending, "src/cli/marketplaces.rs [file]"),
+        "{pending:?}"
+    );
+}
