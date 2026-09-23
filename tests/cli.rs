@@ -724,7 +724,7 @@ fn pending_orders_children_before_parents_and_omits_fresh_entries() {
         sandbox.paths(&json),
         vec!["a.txt", "d/f.txt", "d/g.txt", "d", "."]
     );
-    assert_eq!(json["version"], 2);
+    assert_eq!(json["version"], 3);
     assert_eq!(json["tool"], "treenotes");
     assert_eq!(json["command"], "pending");
     assert_eq!(json["scope"]["path"], ".");
@@ -842,6 +842,135 @@ fn read_scopes_depth_and_subdirectory_invocation() {
     assert!(sandbox
         .fails(&["read", sandbox.root.to_str().unwrap()], 1)
         .contains("outside the repository"));
+}
+
+#[test]
+fn only_filters_a_listing_to_the_named_directories() {
+    let sandbox = marker_repo();
+    sandbox.annotate("lib/b.txt", "beta note");
+
+    // The unfiltered listing is the whole scope, and it says so: no filter, so `filters` is null.
+    let json = sandbox.json(&["read", "--json"]);
+    assert_eq!(
+        sandbox.paths(&json),
+        vec![
+            ".",
+            "a.txt",
+            "lib",
+            "lib/b.txt",
+            "lib/deep",
+            "lib/deep/c.txt",
+            "other",
+            "other/x.txt"
+        ]
+    );
+    assert!(json["scope"]["filters"].is_null());
+
+    // `--only` keeps the named subtree plus every directory between the scope and it.
+    let json = sandbox.json(&["read", "--only", "lib", "--json"]);
+    assert_eq!(
+        sandbox.paths(&json),
+        vec![".", "lib", "lib/b.txt", "lib/deep", "lib/deep/c.txt"]
+    );
+    assert_eq!(json["scope"]["path"], ".");
+    assert_eq!(json["scope"]["filters"], serde_json::json!(["lib"]));
+
+    // The filter is a window over the scope, never a second scope: the scope, the depth origin and
+    // the repository-root relative spellings are unchanged by it.
+    let json = sandbox.json(&["read", "lib", "--only", "lib/deep", "--json"]);
+    assert_eq!(
+        sandbox.paths(&json),
+        vec!["lib", "lib/deep", "lib/deep/c.txt"]
+    );
+    assert_eq!(json["scope"]["path"], "lib");
+    assert_eq!(json["scope"]["filters"], serde_json::json!(["lib/deep"]));
+    let json = sandbox.json(&[
+        "read", "lib", "--only", "lib/deep", "--depth", "1", "--json",
+    ]);
+    assert_eq!(sandbox.paths(&json), vec!["lib", "lib/deep"]);
+
+    // Several trees at once, in one comma-separated flag or repeated; both name the same window.
+    let json = sandbox.json(&["read", "--only", "lib,other", "--json"]);
+    assert_eq!(
+        sandbox.paths(&json),
+        vec![
+            ".",
+            "lib",
+            "lib/b.txt",
+            "lib/deep",
+            "lib/deep/c.txt",
+            "other",
+            "other/x.txt"
+        ]
+    );
+    assert_eq!(
+        json["scope"]["filters"],
+        serde_json::json!(["lib", "other"])
+    );
+    let repeated = sandbox.json(&["read", "--only", "other", "--only", "lib", "--json"]);
+    assert_eq!(sandbox.paths(&repeated), sandbox.paths(&json));
+
+    // Text output is the same windowed tree, still rooted at the scope line.
+    let lines = text_lines(&sandbox.ok(&["read", "--only", "lib"]));
+    assert!(lines[0].starts_with(". [dir]"), "{lines:?}");
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .all(|line| !line.contains("a.txt") && !line.contains("other")),
+        "{lines:?}"
+    );
+
+    // `pending` filters identically, and `--all` is the unfiltered listing spelled out.
+    let json = sandbox.json(&["pending", "--only", "lib", "--json"]);
+    assert_eq!(
+        sandbox.paths(&json),
+        vec!["lib/deep/c.txt", "lib/deep", "lib", "."]
+    );
+    assert_eq!(json["scope"]["filters"], serde_json::json!(["lib"]));
+    let all = sandbox.json(&["pending", "--all", "--json"]);
+    assert_eq!(
+        sandbox.paths(&all),
+        vec![
+            "a.txt",
+            "lib/deep/c.txt",
+            "lib/deep",
+            "lib",
+            "other/x.txt",
+            "other",
+            "."
+        ]
+    );
+    assert!(all["scope"]["filters"].is_null());
+
+    // `--members` follows the same window: a file the filter excluded is not even parsed.
+    sandbox.write("lib/inner.py", &fixture("tests/fixtures/python/service.py"));
+    sandbox.write("other/App.java", &fixture("tests/fixtures/java/Cache.java"));
+    sandbox.commit("sources");
+    let json = sandbox.json(&["read", "--only", "lib", "--members", "--json"]);
+    let members = sandbox.members(&json);
+    assert!(!members.is_empty());
+    assert!(
+        members
+            .iter()
+            .all(|member| member["path"] == "lib/inner.py"),
+        "{members:?}"
+    );
+    assert_eq!(json["parse_error"], false);
+
+    // A filter naming a file, a missing path, or a path the scope excludes is invalid input; the
+    // contradictory pair `--only`/`--all` is a command line usage error.
+    assert!(sandbox
+        .fails(&["read", "--only", "a.txt"], 1)
+        .contains("takes a directory"));
+    assert!(sandbox
+        .fails(&["read", "--only", "nope"], 1)
+        .contains("does not exist"));
+    assert!(sandbox
+        .fails(&["read", "lib", "--only", "other"], 1)
+        .contains("outside the scope"));
+    let out = sandbox.run(&["read", "--only", "lib", "--all"]);
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]
@@ -1540,7 +1669,7 @@ fn ast_members_are_listed_for_source_files_only() {
     sandbox.commit("init");
 
     let json = sandbox.json(&["read", "--members", "--json"]);
-    assert_eq!(json["version"], 2);
+    assert_eq!(json["version"], 3);
     assert_eq!(json["command"], "read");
     assert_eq!(json["parse_error"], false);
     assert!(!sandbox.members(&json).is_empty());
@@ -1827,7 +1956,7 @@ fn version_one_databases_migrate_additively() {
     drop(conn);
 
     let json = sandbox.json(&["read", "a.txt", "--json"]);
-    assert_eq!(json["version"], 2);
+    assert_eq!(json["version"], 3);
     assert_eq!(
         sandbox.entry(&json, "a.txt")["note"],
         "keep me across the migration"
@@ -1885,7 +2014,7 @@ fn schema_two_databases_gain_only_the_derived_tables() {
     drop(conn);
 
     let json = sandbox.json(&["read", "a.txt", "--json"]);
-    assert_eq!(json["version"], 2);
+    assert_eq!(json["version"], 3);
     assert_eq!(
         sandbox.entry(&json, "a.txt")["note"],
         "keep me across the migration"
@@ -1908,7 +2037,7 @@ fn state_hashes_the_tree_and_names_only_what_changed() {
     let first = sandbox.json(&["state", "--json"]);
     let state_hash = first["state"]["state_hash"].as_str().unwrap().to_string();
     assert!(state_hash.starts_with("tnt1:state:"), "{first}");
-    assert_eq!(first["version"], 2);
+    assert_eq!(first["version"], 3);
     assert_eq!(first["command"], "state");
     assert_eq!(first["state"]["known"], false);
     assert_eq!(first["state"]["recorded"], true);
@@ -2009,7 +2138,7 @@ fn pending_members_lists_only_missing_and_stale_declarations() {
 
     // With the flag the tree listing is identical, and every unannotated declaration appears.
     let json = sandbox.json(&["pending", "--members", "--json"]);
-    assert_eq!(json["version"], 2);
+    assert_eq!(json["version"], 3);
     assert_eq!(json["command"], "pending");
     assert_eq!(json["parse_error"], false);
     assert_eq!(sandbox.paths(&json), sandbox.paths(&plain));

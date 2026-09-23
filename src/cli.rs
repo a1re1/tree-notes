@@ -68,6 +68,12 @@ struct PendingArgs {
     /// Also list the missing or stale AST members of the scoped files.
     #[arg(long)]
     members: bool,
+    /// Keep only these directories and their contents (repeatable; `--only src,lib` works too).
+    #[arg(long = "only", value_name = "DIR", value_delimiter = ',')]
+    only: Vec<String>,
+    /// List the whole scope even when `--only` was given; conflicts with `--only`.
+    #[arg(long, conflicts_with = "only")]
+    all: bool,
     /// Emit the versioned JSON envelope instead of text.
     #[arg(long)]
     json: bool,
@@ -83,6 +89,12 @@ struct ReadArgs {
     /// List the annotatable AST members of the scoped files.
     #[arg(long)]
     members: bool,
+    /// Keep only these directories and their contents (repeatable; `--only src,lib` works too).
+    #[arg(long = "only", value_name = "DIR", value_delimiter = ',')]
+    only: Vec<String>,
+    /// Show the whole scope even when `--only` was given; conflicts with `--only`.
+    #[arg(long, conflicts_with = "only")]
+    all: bool,
     /// Emit the versioned JSON envelope instead of text.
     #[arg(long)]
     json: bool,
@@ -215,8 +227,13 @@ where
 }
 
 fn cmd_pending(ctx: &mut Ctx, args: PendingArgs) -> Result<(), CmdError> {
-    let (scope, mut views) = scoped_views(ctx, args.path.as_deref())?;
+    let scope = scope_of(ctx, args.path.as_deref())?;
+    let filters = PathFilters::resolve(ctx, &scope, &args.only, args.all)?;
+    let mut views = scoped_views_in(ctx, &scope)?;
     views.retain(|view| view.status != Status::Fresh);
+    if let Some(filters) = &filters {
+        filters.retain_views(&mut views);
+    }
     views.sort_by(|a, b| compare_children_first(&a.path, &b.path));
 
     // `--members` adds the declaration level below the tree level: a declaration whose note is
@@ -226,7 +243,7 @@ fn cmd_pending(ctx: &mut Ctx, args: PendingArgs) -> Result<(), CmdError> {
     let mut parse_error = false;
     let mut members: Vec<MemberView> = Vec::new();
     if args.members {
-        members = scoped_member_views(ctx, &scope, &mut parse_error)?;
+        members = scoped_member_views(ctx, &scope, filters.as_ref(), &mut parse_error)?;
         members.retain(|member| member.status != Status::Fresh);
         // Shallowest file first, then file order, then document order inside a file: the same
         // coarse-to-fine reading the entry listing gives.
@@ -245,6 +262,7 @@ fn cmd_pending(ctx: &mut Ctx, args: PendingArgs) -> Result<(), CmdError> {
             path: scope.path.clone(),
             kind: scope.kind.as_str().to_string(),
             depth: None,
+            filters: filters.as_ref().map(PathFilters::names),
         });
         envelope.entries = views.iter().map(EntryJson::from).collect();
         envelope.members = members.iter().map(MemberJson::from).collect();
@@ -265,16 +283,21 @@ fn cmd_pending(ctx: &mut Ctx, args: PendingArgs) -> Result<(), CmdError> {
 fn cmd_read(ctx: &mut Ctx, args: ReadArgs) -> Result<(), CmdError> {
     // `--members` may fill the derived member cache, so the whole command takes a mutable context
     // even though the note tables are only read.
-    let (scope, mut views) = scoped_views(ctx, args.path.as_deref())?;
+    let scope = scope_of(ctx, args.path.as_deref())?;
+    let filters = PathFilters::resolve(ctx, &scope, &args.only, args.all)?;
+    let mut views = scoped_views_in(ctx, &scope)?;
     if let Some(depth) = args.depth {
         views.retain(|view| depth_key(&scope.path, &view.path) <= depth);
+    }
+    if let Some(filters) = &filters {
+        filters.retain_views(&mut views);
     }
     views.sort_by(|a, b| a.path.cmp(&b.path));
 
     let mut parse_error = false;
     let mut members: Vec<MemberView> = Vec::new();
     if args.members {
-        members = scoped_member_views(ctx, &scope, &mut parse_error)?;
+        members = scoped_member_views(ctx, &scope, filters.as_ref(), &mut parse_error)?;
         if let Some(depth) = args.depth {
             members.retain(|member| depth_key(&scope.path, &member.path) <= depth);
         }
@@ -292,6 +315,7 @@ fn cmd_read(ctx: &mut Ctx, args: ReadArgs) -> Result<(), CmdError> {
             path: scope.path.clone(),
             kind: scope.kind.as_str().to_string(),
             depth: args.depth,
+            filters: filters.as_ref().map(PathFilters::names),
         });
         envelope.entries = views.iter().map(EntryJson::from).collect();
         envelope.members = members.iter().map(MemberJson::from).collect();
@@ -316,7 +340,7 @@ fn cmd_set(ctx: &mut Ctx, args: SetArgs) -> Result<(), CmdError> {
         }
     };
 
-    let (scope, _) = scoped_views(ctx, Some(&args.path))?;
+    let scope = scope_of(ctx, Some(&args.path))?;
     let entry = ctx
         .entries
         .iter()
@@ -390,6 +414,7 @@ fn cmd_set(ctx: &mut Ctx, args: SetArgs) -> Result<(), CmdError> {
             path: entry.path.clone(),
             kind: entry.kind.as_str().to_string(),
             depth: None,
+            filters: None,
         });
         envelope.message = Some(format!("annotated {} (fresh){ast_suffix}", entry.path));
         envelope.entries = vec![EntryJson::from(&EntryView {
@@ -430,7 +455,7 @@ fn cmd_member_set(ctx: &mut Ctx, args: MemberSetArgs) -> Result<(), CmdError> {
         }
     };
 
-    let (scope, _) = scoped_views(ctx, Some(&args.path))?;
+    let scope = scope_of(ctx, Some(&args.path))?;
     let entry = ctx
         .entries
         .iter()
@@ -484,6 +509,7 @@ fn cmd_member_set(ctx: &mut Ctx, args: MemberSetArgs) -> Result<(), CmdError> {
             path: entry.path.clone(),
             kind: entry.kind.as_str().to_string(),
             depth: None,
+            filters: None,
         });
         envelope.parse_error = Some(parse_error);
         envelope.message = Some(format!(
@@ -577,6 +603,7 @@ fn member_from_cached(cached: &CachedMember) -> ast::Member {
 fn scoped_member_views(
     ctx: &mut Ctx,
     scope: &Scope,
+    filters: Option<&PathFilters>,
     parse_error: &mut bool,
 ) -> Result<Vec<MemberView>, CmdError> {
     let versions = ctx.store.load_member_versions(&ctx.repo.identity)?;
@@ -584,12 +611,17 @@ fn scoped_member_views(
     let no_versions: Vec<MemberVersion> = Vec::new();
     // Only regular files are source: symlinks, submodules and directories are never parsed. The
     // paths are collected first so parsing (which fills the cache through `ctx`) can borrow the
-    // context mutably while this loop walks an owned list.
+    // context mutably while this loop walks an owned list. A file the `--only` window excludes is
+    // not parsed at all, and a syntax error in it cannot mark the listing untrustworthy.
     let paths: Vec<String> = ctx
         .entries
         .iter()
         .filter(|entry| entry.kind == Kind::File)
         .filter(|entry| in_scope(&entry.path, &scope.path, scope.kind))
+        .filter(|entry| match filters {
+            Some(filters) => filters.keeps(&entry.path),
+            None => true,
+        })
         .map(|entry| entry.path.clone())
         .collect();
     let mut views = Vec::new();
@@ -1003,15 +1035,102 @@ fn nearest_label<'a>(labels: &BTreeMap<&'a str, &'a str>, path: &str) -> Option<
     }
 }
 
-/// Current entries within a path scope, paired with their stored note versions.
-fn scoped_views(ctx: &Ctx, path: Option<&str>) -> Result<(Scope, Vec<EntryView>), CmdError> {
-    let scope = match path {
-        Some(path) => resolve_scope(&ctx.repo, &ctx.entries, path)?,
-        None => Scope {
+/// Resolve a command's path argument to its scope; the whole repository when none was given.
+fn scope_of(ctx: &Ctx, path: Option<&str>) -> Result<Scope, CmdError> {
+    match path {
+        Some(path) => resolve_scope(&ctx.repo, &ctx.entries, path),
+        None => Ok(Scope {
             path: ".".to_string(),
             kind: Kind::Dir,
-        },
-    };
+        }),
+    }
+}
+
+/// A resolved `--only` window: the directories whose subtrees stay in a listing.
+///
+/// A filter is a *window over the scope*, never a second scope. It only ever removes entries the
+/// scope would have listed, so `read src --depth 2 --only lib` still counts depth from `src` and a
+/// path keeps its repository-root relative spelling. That is the point of the flag: a repository
+/// with thirty top-level directories is read one subtree at a time instead of drowning the reader
+/// in entries nobody asked about. The scope itself and the directories between it and a named
+/// directory stay, so a windowed tree still hangs from its scope line instead of starting mid-air.
+struct PathFilters {
+    /// Named directories, repository-root relative, deduplicated and in name order.
+    only: Vec<String>,
+    /// The scope, every named directory, and the directories between them.
+    nodes: BTreeSet<String>,
+}
+
+impl PathFilters {
+    /// Resolve `--only` arguments against `scope`; `None` when no filter applies.
+    fn resolve(
+        ctx: &Ctx,
+        scope: &Scope,
+        only: &[String],
+        all: bool,
+    ) -> Result<Option<PathFilters>, CmdError> {
+        if all || only.is_empty() {
+            return Ok(None);
+        }
+        let mut named: BTreeSet<String> = BTreeSet::new();
+        for arg in only {
+            let dir = scope_of(ctx, Some(arg.as_str()))?;
+            if dir.kind != Kind::Dir {
+                return Err(CmdError::usage(format!(
+                    "--only takes a directory; {} is a {}",
+                    dir.path,
+                    dir.kind.as_str()
+                )));
+            }
+            if !in_scope(&dir.path, &scope.path, scope.kind) {
+                return Err(CmdError::usage(format!(
+                    "--only {} is outside the scope {}",
+                    dir.path, scope.path
+                )));
+            }
+            named.insert(dir.path);
+        }
+        let mut nodes = named.clone();
+        for dir in &named {
+            let mut current = dir.as_str();
+            while current != scope.path.as_str() {
+                current = parent_path(current);
+                nodes.insert(current.to_string());
+                if current == "." {
+                    break;
+                }
+            }
+        }
+        Ok(Some(PathFilters {
+            only: named.into_iter().collect(),
+            nodes,
+        }))
+    }
+
+    /// The named directories, as reported by `--json`.
+    fn names(&self) -> Vec<String> {
+        self.only.clone()
+    }
+
+    /// True when `path` is inside a named directory, or is one of the directories between the
+    /// scope and a named directory. `path` is repository-root relative.
+    fn keeps(&self, path: &str) -> bool {
+        if self.nodes.contains(path) {
+            return true;
+        }
+        self.only
+            .iter()
+            .any(|dir| dir == "." || path.starts_with(&format!("{dir}/")))
+    }
+
+    /// Drop the entries the window excludes.
+    fn retain_views(&self, views: &mut Vec<EntryView>) {
+        views.retain(|view| self.keeps(&view.path));
+    }
+}
+
+/// Current entries within an already resolved scope, paired with their stored note versions.
+fn scoped_views_in(ctx: &Ctx, scope: &Scope) -> Result<Vec<EntryView>, CmdError> {
     let versions = ctx.store.load_versions(&ctx.repo.identity)?;
     let empty: Vec<NoteVersion> = Vec::new();
     let mut views = Vec::new();
@@ -1021,7 +1140,7 @@ fn scoped_views(ctx: &Ctx, path: Option<&str>) -> Result<(Scope, Vec<EntryView>)
             views.push(EntryView::build(entry, stored));
         }
     }
-    Ok((scope, views))
+    Ok(views)
 }
 
 /// Resolve a user supplied path argument to a Git-visible tree entry.

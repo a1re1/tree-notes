@@ -30,8 +30,8 @@ the dependency set requires) and `git` on `PATH`. SQLite is bundled through
 ```
 treenotes [--repo DIR] [--db PATH] <COMMAND>
 
-treenotes pending    [PATH] [--members] [--json]
-treenotes read       [PATH] [--depth N] [--members] [--json]
+treenotes pending    [PATH] [--members] [--only DIR[,DIR...]] [--all] [--json]
+treenotes read       [PATH] [--depth N] [--members] [--only DIR[,DIR...]] [--all] [--json]
 treenotes set        PATH [--note TEXT] [--expected-hash HASH] [--ast] [--json]
 treenotes member-set PATH SYMBOL [--note TEXT] [--expected-hash HASH] [--json]
 treenotes import     [FILE|-] [--json]
@@ -62,6 +62,18 @@ Commands:
   ASCII tree — a parent above its children, `│` for levels that continue, `├──` for a child with
   siblings after it and `└──` for the last one — or a versioned JSON envelope with `--json`. Root
   (`.`) and unannotated entries are always included so coverage gaps stay visible.
+* `read [PATH] --only DIR[,DIR...]` (and the same flags on `pending [PATH]`) — narrow the listing to
+  the named directories and everything below them, so a repository with thirty top-level directories
+  is read one subtree at a time instead of whole. `--only` is repeatable and accepts a
+  comma-separated list (`--only src,lib` == `--only src --only lib`). Every named path must be a
+  directory inside the scope; a file, a nonexistent path, or a path that this command's own `PATH`
+  argument excludes is rejected with exit code 1 rather than matching nothing. The filter is a
+  **window over the scope, never a second scope**: the scope stays the scope, paths keep their
+  repository-root relative spelling, and `--depth` still counts from the scope. The scope itself and
+  the directories between it and a named directory stay in the listing, so a windowed tree still
+  hangs from its root line. `--members` follows the same window and never parses a file it excluded.
+  `--all` spells out the unfiltered listing and conflicts with `--only`. Without the flag nothing
+  changes. `--json` reports the window in `scope.filters`.
 * `set PATH --note TEXT [--expected-hash HASH]` — annotate the *current* version of `PATH`. With no
   `--note`, the one-line note is read from stdin (`printf 'summary\n' | treenotes set src/lib.rs`),
   which avoids shell-quoting friction. `--expected-hash` refuses the write unless the current hash
@@ -223,15 +235,16 @@ Notes are never garbage-collected in this version; the database grows with annot
 
 ## JSON contract
 
-`--json` prints one versioned envelope. `version` is `2`; it is bumped whenever the shape changes.
+`--json` prints one versioned envelope. `version` is `3`; it is bumped whenever the shape changes.
 Version 2 adds the `members` array (member listing, `set --ast`, `member-set`) and the optional
-`parse_error` flag. Every envelope still carries `entries` exactly as before, and an envelope that
-deals in no members carries an empty `members` array and no `parse_error`, so a consumer that
-ignores unknown fields keeps working.
+`parse_error` flag. Version 3 adds `scope.filters`, the directories a listing was narrowed to by
+`--only` (`null` when no filter was given). Every envelope still carries `entries` exactly as
+before, and an envelope that deals in no members carries an empty `members` array and no
+`parse_error`, so a consumer that ignores unknown fields keeps working.
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "tool": "treenotes",
   "command": "read",
   "repository": {
@@ -239,7 +252,7 @@ ignores unknown fields keeps working.
     "root": "/home/me/project",
     "common_dir": "/home/me/project/.git"
   },
-  "scope": { "path": ".", "kind": "dir", "depth": null },
+  "scope": { "path": ".", "kind": "dir", "depth": null, "filters": null },
   "entries": [
     {
       "path": "src/lib.rs",
@@ -281,7 +294,10 @@ Field notes:
 * `version`, `tool`, `command` and `repository` are always present. `repository.identity` is the
   same value in every linked worktree.
 * `scope` appears for `pending` and `read` (`path` is `"."` for the whole repository; `kind` is
-  `file`/`dir`/`symlink`/`submodule`; `depth` is the requested limit or `null`).
+  `file`/`dir`/`symlink`/`submodule`; `depth` is the requested limit or `null`; `filters` is the
+  sorted list of directories `--only` narrowed the listing to, or `null` when no filter was given.
+  `path` is still the scope and the directories between `path` and each filter are still listed, so
+  a consumer can tell a filtered listing from a narrowed scope).
 * `entries` is a deterministic array: `read` orders entries by path; `pending` orders descendants
   before ancestors with the scope last. The text tree is a rendering of the same data, not a second
   model: `--json` output is unchanged by it, and `members` is always ordered by path, then document
@@ -333,6 +349,9 @@ $ treenotes import batch.json
 # 4. Read the compact annotated map, scoped to what the next step needs.
 $ treenotes read src --depth 2 --json
 
+# 4b. In a repository with thirty top-level directories, read only the subtrees that matter.
+$ treenotes read --only src,lib --json
+
 # 5. Feed that JSON to an external relevance classifier (e.g. jev) — outside treenotes.
 
 # After edits, re-run `pending`: only entries whose content changed reappear, and any version
@@ -367,6 +386,9 @@ Re-run `pending` after concurrent edits.
   removes repeated *parsing*, not the inventory scan, and notes are cached only implicitly (an
   unchanged file's members are reused, but its note is still resolved from the `member_notes`
   table).
+* `--only` bounds what is *printed*, not what is read: the inventory and hashing cost is unchanged,
+  so a filter shrinks the output, never the scan. It also excludes the filtered-out subtrees from
+  `--members` parsing, which is the expensive part of a member listing.
 
 ## Development
 
