@@ -667,6 +667,10 @@ pub struct ScopeJson {
     pub kind: String,
     /// Maximum depth below the scope, when `--depth` was given.
     pub depth: Option<usize>,
+    /// Directories the listing was narrowed to, when `--only` was given; null without a filter.
+    /// They are always inside the scope, and the scope plus the directories between it and a named
+    /// directory are still listed.
+    pub filters: Option<Vec<String>>,
 }
 
 /// Versioned JSON envelope emitted on stdout by `--json` commands.
